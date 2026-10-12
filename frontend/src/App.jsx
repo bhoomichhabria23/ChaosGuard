@@ -105,7 +105,10 @@ function MetricCard({ icon: Icon, label, value, note, color, trend, showMore = t
   return <div className={`metric-card metric-${color}`}><div className="metric-top"><span className="metric-icon"><Icon size={16} /></span>{trend && <span className={`metric-trend ${trend.startsWith('-') ? 'trend-down' : ''}`}><ArrowUpRight size={12} />{trend}</span>}{showMore && <button className="metric-more" aria-label={`More about ${label}`}><MoreHorizontal size={16} /></button>}</div><span className="metric-label">{label}</span><strong>{value}</strong><span className="metric-note">{note}</span><div className="metric-decoration" /></div>
 }
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '')
+const API_BASE = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.PROD ? 'https://chaosguard-backend.onrender.com' : '')
+).trim().replace(/\/+$/, '')
 const serviceNames = ['user-service', 'order-service', 'payment-service', 'notification-service']
 const N_A = 'N/A'
 
