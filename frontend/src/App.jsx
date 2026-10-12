@@ -135,9 +135,13 @@ async function apiRequest(path, options = {}) {
       )
     }
   } else {
+    const responseOrigin = response.url
+      ? new URL(response.url).origin
+      : 'unknown host'
+    const contentType = response.headers.get('content-type') || 'unknown content type'
     throw new Error(
-      `The API returned an empty response (HTTP ${response.status}). ` +
-      'Check VITE_API_BASE_URL and verify that it points to the deployed backend.'
+      `The API at ${responseOrigin} returned an empty response (HTTP ${response.status}, ${contentType}). ` +
+      'Set VITE_API_BASE_URL to the deployed backend URL and rebuild the frontend.'
     )
   }
   if (!response.ok) {

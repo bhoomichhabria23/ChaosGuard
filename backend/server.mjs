@@ -37,7 +37,7 @@ const port = Number(
   process.env.PORT || 4174
 )
 const frontendOrigin = (
-  process.env.FRONTEND_ORIGIN || ''
+  process.env.FRONTEND_ORIGIN || 'https://chaosguard-frontend.onrender.com'
 ).trim().replace(/\/+$/, '')
 const prometheusUrl = (
   process.env.PROMETHEUS_URL || 'http://localhost:9090'
