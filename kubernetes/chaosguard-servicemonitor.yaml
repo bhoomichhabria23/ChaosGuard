@@ -1,0 +1,26 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: chaosguard-services
+  namespace: default
+  labels:
+    release: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - default
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - user-service
+          - order-service
+          - payment-service
+          - notification-service
+  jobLabel: app
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 1s
+      scrapeTimeout: 1s
