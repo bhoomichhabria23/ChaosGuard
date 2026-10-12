@@ -15,7 +15,10 @@ import {
 } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 import { Writable } from 'node:stream'
+import dotenv from 'dotenv'
+import { MongoClient } from 'mongodb'
 import * as k8s from '@kubernetes/client-node'
 import axios from 'axios'
 import {
@@ -33,9 +36,15 @@ import {
   observeTargetPodFailure,
 } from './pod-failure-observations.mjs'
 
+dotenv.config({
+  path: fileURLToPath(new URL('./.env', import.meta.url)),
+})
+
 const port = Number(
   process.env.PORT || 4174
 )
+const mongoUri = process.env.MONGODB_URI?.trim()
+const mongoDatabaseName = process.env.MONGODB_DB_NAME?.trim() || 'chaosguard'
 const frontendOrigins = new Set([
   'https://chaosguard-frontend.onrender.com',
   ...(process.env.FRONTEND_ORIGIN || '')
@@ -84,6 +93,8 @@ const experiments = []
 let experimentsLoaded = false
 const sessions = new Map()
 let sessionWriteQueue = Promise.resolve()
+let mongoClient
+let mongoCollections
 
 const kubeConfig =
   new k8s.KubeConfig()
@@ -177,8 +188,46 @@ function createSilentWritable() {
   })
 }
 
+async function connectDatabase() {
+  if (!mongoUri) {
+    if (
+      process.env.NODE_ENV === 'production' ||
+      process.env.RENDER_SERVICE_ID
+    ) {
+      throw new Error('MONGODB_URI must be configured in production')
+    }
+    return
+  }
+
+  mongoClient = new MongoClient(mongoUri, {
+    serverSelectionTimeoutMS: 10000,
+  })
+  await mongoClient.connect()
+  const database = mongoClient.db(mongoDatabaseName)
+  mongoCollections = {
+    users: database.collection('users'),
+    experiments: database.collection('experiments'),
+    sessions: database.collection('sessions'),
+  }
+  await Promise.all([
+    mongoCollections.users.createIndex({ email: 1 }, { unique: true }),
+    mongoCollections.experiments.createIndex({ id: 1 }, { unique: true }),
+    mongoCollections.experiments.createIndex({ userId: 1, startedAt: -1 }),
+    mongoCollections.sessions.createIndex({ tokenHash: 1 }, { unique: true }),
+    mongoCollections.sessions.createIndex({ expiresAt: 1 }),
+  ])
+}
+
 async function loadExperiments() {
   if (experimentsLoaded) {
+    return
+  }
+
+  if (mongoCollections) {
+    experiments.push(
+      ...await mongoCollections.experiments.find({}).toArray()
+    )
+    experimentsLoaded = true
     return
   }
 
@@ -224,7 +273,24 @@ async function loadExperiments() {
   experimentsLoaded = true
 }
 
-async function saveExperiments() {
+async function saveExperiments(userId) {
+  if (mongoCollections) {
+    const userExperiments = experiments.filter(
+      (experiment) => experiment.userId === userId
+    )
+    const operations = userExperiments.map((experiment) => ({
+      replaceOne: {
+        filter: { id: experiment.id, userId },
+        replacement: experiment,
+        upsert: true,
+      },
+    }))
+    if (operations.length) {
+      await mongoCollections.experiments.bulkWrite(operations)
+    }
+    return
+  }
+
   await mkdir(
     dirname(experimentsFile),
     {
@@ -281,7 +347,11 @@ async function recordExperiment(
       user?.id || null
   })
 
-  await saveExperiments()
+  if (user) {
+    await saveExperiments(user.id)
+  } else {
+    await saveExperiments()
+  }
 
   return experiment
 }
@@ -1245,6 +1315,10 @@ async function runMemoryStress(
  */
 
 async function loadUsers() {
+  if (mongoCollections) {
+    return mongoCollections.users.find({}).toArray()
+  }
+
   try {
     await access(
       usersFile
@@ -1290,6 +1364,21 @@ async function loadUsers() {
 async function saveUsers(
   users
 ) {
+  if (mongoCollections) {
+    if (users.length) {
+      await mongoCollections.users.bulkWrite(
+        users.map((user) => ({
+          replaceOne: {
+            filter: { id: user.id },
+            replacement: user,
+            upsert: true,
+          },
+        }))
+      )
+    }
+    return
+  }
+
   await mkdir(
     dirname(usersFile),
     {
@@ -1402,7 +1491,20 @@ async function getSessionUser(
       .digest('hex')
 
   if (!sessions.has(sessionKey)) {
-    await restoreSessions()
+    if (mongoCollections) {
+      const storedSession = await mongoCollections.sessions.findOne({
+        tokenHash: sessionKey,
+        expiresAt: { $gt: Date.now() },
+      })
+      if (storedSession) {
+        sessions.set(sessionKey, {
+          userId: storedSession.userId,
+          expiresAt: storedSession.expiresAt,
+        })
+      }
+    } else {
+      await restoreSessions()
+    }
   }
 
   const session = sessions.get(sessionKey)
@@ -1426,18 +1528,22 @@ async function getSessionUser(
 
 async function restoreSessions() {
   let parsedSessions
-  try {
-    parsedSessions = JSON.parse(
-      await readFile(
-        sessionsFile,
-        'utf8'
+  if (mongoCollections) {
+    parsedSessions = await mongoCollections.sessions.find({}).toArray()
+  } else {
+    try {
+      parsedSessions = JSON.parse(
+        await readFile(
+          sessionsFile,
+          'utf8'
+        )
       )
-    )
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        return
+      }
+      throw error
     }
-    throw error
   }
 
   if (!Array.isArray(parsedSessions)) {
@@ -1469,8 +1575,26 @@ async function restoreSessions() {
   }
 
   if (needsSave) {
-    await persistSessions()
+    await persistSession(sessionKey)
   }
+}
+
+async function persistSession(sessionKey) {
+  if (!mongoCollections) {
+    return persistSessions()
+  }
+
+  const session = sessions.get(sessionKey)
+  if (!session) {
+    await mongoCollections.sessions.deleteOne({ tokenHash: sessionKey })
+    return
+  }
+
+  await mongoCollections.sessions.replaceOne(
+    { tokenHash: sessionKey },
+    { tokenHash: sessionKey, ...session },
+    { upsert: true }
+  )
 }
 
 function persistSessions() {
@@ -1489,6 +1613,25 @@ function persistSessions() {
   const saveOperation =
     sessionWriteQueue.then(
       async () => {
+        if (mongoCollections) {
+          const operations = [...sessions.entries()].map(
+            ([tokenHash, session]) => ({
+              replaceOne: {
+                filter: { tokenHash },
+                replacement: { tokenHash, ...session },
+                upsert: true,
+              },
+            })
+          )
+          if (operations.length) {
+            await mongoCollections.sessions.bulkWrite(operations)
+          }
+          await mongoCollections.sessions.deleteMany({
+            expiresAt: { $lte: Date.now() },
+          })
+          return
+        }
+
         await mkdir(
           dirname(sessionsFile),
           { recursive: true }
@@ -1806,12 +1949,21 @@ const server =
             error
           )
 
+          if (error.code === 11000) {
+            return respond(
+              response,
+              409,
+              { error: 'An account with that email already exists' }
+            )
+          }
+
           return respond(
             response,
-            400,
+            error instanceof SyntaxError ? 400 : 500,
             {
-              error:
-                'Request body must be valid JSON'
+              error: error instanceof SyntaxError
+                ? 'Request body must be valid JSON'
+                : 'Unable to register account'
             }
           )
         }
@@ -1889,7 +2041,7 @@ const server =
           )
 
           try {
-            await persistSessions()
+            await persistSession(sessionKey)
           } catch (error) {
             sessions.delete(sessionKey)
             console.error(
@@ -2344,7 +2496,7 @@ const server =
         }
 
         if (scoresAdded) {
-          await saveExperiments()
+          await saveExperiments(user.id)
         }
 
         return respond(
@@ -2414,8 +2566,16 @@ const server =
           )
         }
 
+        if (mongoCollections) {
+          await mongoCollections.experiments.deleteOne({
+            id: experimentId,
+            userId: user.id,
+          })
+        }
         experiments.splice(experimentIndex, 1)
-        await saveExperiments()
+        if (!mongoCollections) {
+          await saveExperiments()
+        }
 
         return respond(
           response,
@@ -3779,7 +3939,8 @@ server.on(
  * START SERVER
  */
 
-restoreSessions()
+connectDatabase()
+  .then(() => restoreSessions())
   .then(
     () => {
       server.listen(
@@ -3796,9 +3957,12 @@ restoreSessions()
   .catch(
     (error) => {
       console.error(
-        'Unable to restore authentication sessions:',
+        'Unable to initialize MongoDB or restore authentication sessions:',
         error
       )
+      mongoClient?.close().catch((closeError) => {
+        console.error('Unable to close MongoDB client:', closeError)
+      })
       process.exitCode = 1
     }
   )

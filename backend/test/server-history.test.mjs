@@ -26,7 +26,13 @@ test('GET /api/experiments returns and persists scores for completed history', a
   const port = await getAvailablePort()
   let serverProcess = spawn(process.execPath, [serverPath], {
     cwd: workspace,
-    env: { ...process.env, PORT: String(port) },
+    env: {
+      ...process.env,
+      PORT: String(port),
+      MONGODB_URI: '',
+      RENDER_SERVICE_ID: '',
+      NODE_ENV: 'test',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let serverOutput = ''
@@ -197,7 +203,13 @@ test('GET /api/experiments returns and persists scores for completed history', a
   await once(serverProcess, 'exit')
   serverProcess = spawn(process.execPath, [serverPath], {
     cwd: workspace,
-    env: { ...process.env, PORT: String(port) },
+    env: {
+      ...process.env,
+      PORT: String(port),
+      MONGODB_URI: '',
+      RENDER_SERVICE_ID: '',
+      NODE_ENV: 'test',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   serverProcess.stdout.setEncoding('utf8').on('data', (chunk) => {

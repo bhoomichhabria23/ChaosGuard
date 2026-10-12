@@ -24,7 +24,7 @@ The backend prints `ChaosGuard API listening on http://localhost:4174` in its te
 
 Set `VITE_API_BASE_URL` in the frontend hosting service to the backend's public base URL (for example, `https://your-api.example.com`) and rebuild the frontend. The backend allows `https://chaosguard-frontend.onrender.com` by default. Set `FRONTEND_ORIGIN` to add one or more additional exact frontend origins (comma-separated, with no paths) if needed. The API uses allowed origins for credentialed CORS requests and secure cross-site session cookies. Keep `FRONTEND_ORIGIN` unset for local same-origin/Vite-proxy development.
 
-The backend creates missing `data/users.json`, `data/sessions.json`, and `data/experiments.json` files as needed. They are intentionally excluded from Git. If the hosting service uses an ephemeral filesystem, attach persistent storage at the backend's `data` directory; otherwise registered accounts, sessions, and experiment history can be lost when the instance restarts or is redeployed.
+Configure `MONGODB_URI` in `backend/.env` for local development and in the backend hosting service's secret environment settings for production; optionally set `MONGODB_DB_NAME` (defaults to `chaosguard`). In Atlas, allow the backend host's outbound IP addresses under Network Access and use a database user limited to the required database. The backend stores registered users, sessions, and per-user resilience reports in MongoDB. Production startup fails if the MongoDB URI is missing or the database cannot be reached; JSON-file persistence is used only for local development and tests. Never commit `.env`.
 
 ## API
 
