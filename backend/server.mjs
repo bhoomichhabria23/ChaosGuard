@@ -36,9 +36,13 @@ import {
 const port = Number(
   process.env.PORT || 4174
 )
-const frontendOrigin = (
-  process.env.FRONTEND_ORIGIN || 'https://chaosguard-frontend.onrender.com'
-).trim().replace(/\/+$/, '')
+const frontendOrigins = new Set([
+  'https://chaosguard-frontend.onrender.com',
+  ...(process.env.FRONTEND_ORIGIN || '')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/+$/, ''))
+    .filter(Boolean),
+])
 const prometheusUrl = (
   process.env.PROMETHEUS_URL || 'http://localhost:9090'
 ).replace(/\/+$/, '')
@@ -1573,8 +1577,8 @@ const server =
       response
     ) => {
       const origin = request.headers.origin
-      if (frontendOrigin && origin === frontendOrigin) {
-        response.setHeader('Access-Control-Allow-Origin', frontendOrigin)
+      if (origin && frontendOrigins.has(origin)) {
+        response.setHeader('Access-Control-Allow-Origin', origin)
         response.setHeader('Access-Control-Allow-Credentials', 'true')
         response.setHeader('Vary', 'Origin')
 
@@ -1901,7 +1905,7 @@ const server =
 
           response.setHeader(
             'Set-Cookie',
-            `session=${token}; HttpOnly; SameSite=${frontendOrigin ? 'None; Secure' : 'Lax'}; Path=/; Max-Age=${sessionLifetimeMs / 1000}`
+            `session=${token}; HttpOnly; SameSite=${origin && frontendOrigins.has(origin) ? 'None; Secure' : 'Lax'}; Path=/; Max-Age=${sessionLifetimeMs / 1000}`
           )
 
           return respond(
