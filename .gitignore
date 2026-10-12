@@ -3,3 +3,6 @@ dist/
 .env
 .env.*
 !.env.example
+/backend/data/experiments.json
+/backend/data/sessions.json
+/backend/data/users.json

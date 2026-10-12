@@ -587,6 +587,13 @@ function HistoryPage({ history, onOpenResult }) {
   </>
 }
 
+function createPrintableReport(item) {
+  return {
+    ...item,
+    reportGeneratedAt: new Date().toISOString(),
+  }
+}
+
 function ReportsPage({ history, user, onDeleteReport }) {
   const [printReport, setPrintReport] = useState(null)
   useEffect(() => {
@@ -610,13 +617,7 @@ function ReportsPage({ history, user, onDeleteReport }) {
     }
   }, [printReport])
 
-  const downloadReport = (item) => {
-    const reportGeneratedAt = new Date().toISOString()
-    setPrintReport({
-      ...item,
-      reportGeneratedAt,
-    })
-  }
+  const downloadReport = (item) => setPrintReport(createPrintableReport(item))
   const getReportFields = (item) => {
     const fields = [
       ['Registered user', user?.name || N_A],
@@ -802,7 +803,6 @@ function SettingsPage({ onLogout, onToast, onUserUpdated, user }) {
       setToast(error.message)
     }
   }
-  useEffect(() => { if (user) loadHistory() }, [user])
   useEffect(() => { if (!toast) return undefined; const timer = window.setTimeout(() => setToast(''), 3200); return () => window.clearTimeout(timer) }, [toast])
   const navigate = (nextPage) => { if (nextPage === 'login') setUser(null); if (nextPage !== 'landing' && nextPage !== 'login' && !user) { setPage('login'); return } setPage(nextPage); window.scrollTo({ top: 0, behavior: 'smooth' }) }
   const configure = (experiment) => { setSelectedExperiment(experiment); setPage('configure') }
@@ -826,7 +826,7 @@ function SettingsPage({ onLogout, onToast, onUserUpdated, user }) {
   }
   const openHistoryResult = (row) => { setRunDetails(row); setSelectedExperiment(experiments.find((item) => item.id === (row.type === 'pod-failure' ? 'pod' : row.type === 'cpu-stress' ? 'cpu' : 'memory')) || experiments[0]); setPage('result') }
   if (page === 'landing') return <Landing onNavigate={navigate} />
-  if (page === 'login') return <><AuthPage onAuthenticated={(authenticatedUser) => { setUser(authenticatedUser); setToast('Signed in successfully.'); setPage('dashboard') }} onToast={setToast} onBack={() => navigate('landing')} />{toast && <div className="toast"><CheckCircle2 size={16} />{toast}<button onClick={() => setToast('')} aria-label="Dismiss notification"><X size={14} /></button></div>}</>
+  if (page === 'login') return <><AuthPage onAuthenticated={(authenticatedUser) => { setUser(authenticatedUser); setToast('Signed in successfully.'); setPage('dashboard'); loadHistory() }} onToast={setToast} onBack={() => navigate('landing')} />{toast && <div className="toast"><CheckCircle2 size={16} />{toast}<button onClick={() => setToast('')} aria-label="Dismiss notification"><X size={14} /></button></div>}</>
   const pageContent = page === 'dashboard' ? <Overview onNavigate={navigate} history={history} /> : page === 'services' ? <ServicesPage onNavigate={navigate} /> : page === 'experiments' ? <ExperimentsPage onConfigure={configure} onNavigate={navigate} history={history} /> : page === 'configure' ? <ConfigurationPage key={selectedExperiment.id} experiment={selectedExperiment} onBack={() => navigate('experiments')} onRun={runExperiment} /> : page === 'live' ? <MonitoringPage experiment={runDetails || { name: selectedExperiment.name, target: N_A }} status={runStatus} error={runError} /> : page === 'result' ? <ResultPage onNavigate={navigate} onConfigure={configure} experiment={runDetails || { type: selectedExperiment.id }} /> : page === 'reports' ? <ReportsPage history={history} user={user} onDeleteReport={deleteExperimentReport} /> : page === 'history' ? <HistoryPage history={history} onOpenResult={openHistoryResult} /> : <SettingsPage onLogout={signOut} onToast={setToast} onUserUpdated={setUser} user={user} />
   return <><AppShell page={page} onNavigate={navigate} onToast={setToast} user={user}>{pageContent}</AppShell>{toast && <div className="toast"><CheckCircle2 size={16} />{toast}<button onClick={() => setToast('')} aria-label="Dismiss notification"><X size={14} /></button></div>}</>
 }
