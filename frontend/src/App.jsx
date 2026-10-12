@@ -119,8 +119,24 @@ async function apiRequest(path, options = {}) {
   } catch {
     throw new Error('Unable to reach the API. Check the API URL and cross-origin configuration.')
   }
+  const responseText = await response.text()
   let data = null
-  try { data = await response.json() } catch { data = null }
+  if (responseText.trim()) {
+    try {
+      data = JSON.parse(responseText)
+    } catch {
+      const contentType = response.headers.get('content-type') || 'unknown content type'
+      throw new Error(
+        `The API returned a non-JSON response (HTTP ${response.status}, ${contentType}). ` +
+        'Set VITE_API_BASE_URL in the frontend hosting environment and rebuild the frontend.'
+      )
+    }
+  } else {
+    throw new Error(
+      `The API returned an empty response (HTTP ${response.status}). ` +
+      'Check VITE_API_BASE_URL and verify that it points to the deployed backend.'
+    )
+  }
   if (!response.ok) {
     const requestError = new Error(data?.error || data?.message || 'The backend could not complete the request.')
     requestError.responseData = data
