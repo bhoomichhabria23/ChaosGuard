@@ -65,24 +65,11 @@ function AuthPage({ onAuthenticated, onBack, onToast }) {
     setError('')
     setSubmitting(true)
     try {
-      const response = await fetch(`/api/auth/${mode === 'login' ? 'login' : 'register'}`, {
+      const body = await apiRequest(`/api/auth/${mode === 'login' ? 'login' : 'register'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
         body: JSON.stringify({ name, email, password }),
       })
-      const responseText = await response.text()
-      let body = {}
-      if (responseText) {
-        try {
-          body = JSON.parse(responseText)
-        } catch {
-          throw new Error(response.status >= 500
-            ? 'Authentication service is unavailable. Start the API with npm run dev.'
-            : `Authentication service returned an invalid response (${response.status})`)
-        }
-      }
-      if (!response.ok) throw new Error(body.error || 'Unable to authenticate')
       if (!body.user) throw new Error('Authentication service did not return a user')
       if (isLogin) {
         onAuthenticated(body.user)
@@ -118,7 +105,7 @@ function MetricCard({ icon: Icon, label, value, note, color, trend, showMore = t
   return <div className={`metric-card metric-${color}`}><div className="metric-top"><span className="metric-icon"><Icon size={16} /></span>{trend && <span className={`metric-trend ${trend.startsWith('-') ? 'trend-down' : ''}`}><ArrowUpRight size={12} />{trend}</span>}{showMore && <button className="metric-more" aria-label={`More about ${label}`}><MoreHorizontal size={16} /></button>}</div><span className="metric-label">{label}</span><strong>{value}</strong><span className="metric-note">{note}</span><div className="metric-decoration" /></div>
 }
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '')
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '')
 const serviceNames = ['user-service', 'order-service', 'payment-service', 'notification-service']
 const N_A = 'N/A'
 
@@ -130,7 +117,7 @@ async function apiRequest(path, options = {}) {
       credentials: options.credentials ?? 'include',
     })
   } catch {
-    throw new Error('Backend unavailable. Start the Node.js backend on port 4174.')
+    throw new Error('Unable to reach the API. Check the API URL and cross-origin configuration.')
   }
   let data = null
   try { data = await response.json() } catch { data = null }

@@ -20,6 +20,12 @@ npm run dev
 
 The backend prints `ChaosGuard API listening on http://localhost:4174` in its terminal. The frontend terminal prints the Vite URL; Vite proxies `/api` requests to the backend on port `4174` and does not start or log the backend.
 
+## Deploy the frontend and API separately
+
+Set `VITE_API_BASE_URL` in the frontend hosting service to the backend's public base URL (for example, `https://your-api.example.com`) and rebuild the frontend. Set `FRONTEND_ORIGIN` in the backend hosting service to the frontend's exact origin (for example, `https://your-app.example.com`, with no path). The API uses this origin for credentialed CORS requests and secure cross-site session cookies. Keep `FRONTEND_ORIGIN` unset for local same-origin/Vite-proxy development.
+
+The backend creates missing `data/users.json`, `data/sessions.json`, and `data/experiments.json` files as needed. They are intentionally excluded from Git. If the hosting service uses an ephemeral filesystem, attach persistent storage at the backend's `data` directory; otherwise registered accounts, sessions, and experiment history can be lost when the instance restarts or is redeployed.
+
 ## API
 
 - `GET /api/health` reports API status.

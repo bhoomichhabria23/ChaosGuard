@@ -36,6 +36,9 @@ import {
 const port = Number(
   process.env.PORT || 4174
 )
+const frontendOrigin = (
+  process.env.FRONTEND_ORIGIN || ''
+).trim().replace(/\/+$/, '')
 const prometheusUrl = (
   process.env.PROMETHEUS_URL || 'http://localhost:9090'
 ).replace(/\/+$/, '')
@@ -1569,6 +1572,24 @@ const server =
       request,
       response
     ) => {
+      const origin = request.headers.origin
+      if (frontendOrigin && origin === frontendOrigin) {
+        response.setHeader('Access-Control-Allow-Origin', frontendOrigin)
+        response.setHeader('Access-Control-Allow-Credentials', 'true')
+        response.setHeader('Vary', 'Origin')
+
+        if (request.method === 'OPTIONS') {
+          response.writeHead(204, {
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers':
+              request.headers['access-control-request-headers'] || 'Content-Type',
+            'Access-Control-Max-Age': '600',
+          })
+          response.end()
+          return
+        }
+      }
+
       const url =
         new URL(
           request.url || '/',
@@ -1880,7 +1901,7 @@ const server =
 
           response.setHeader(
             'Set-Cookie',
-            `session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${sessionLifetimeMs / 1000}`
+            `session=${token}; HttpOnly; SameSite=${frontendOrigin ? 'None; Secure' : 'Lax'}; Path=/; Max-Age=${sessionLifetimeMs / 1000}`
           )
 
           return respond(
@@ -3759,6 +3780,7 @@ restoreSessions()
     () => {
       server.listen(
         port,
+        '0.0.0.0',
         () => {
           console.log(
             `ChaosGuard API listening on http://localhost:${port}`
