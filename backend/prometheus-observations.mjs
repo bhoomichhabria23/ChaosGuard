@@ -74,6 +74,7 @@ export function createErrorRateMeasurement({
     totalRequests: roundCount(requestCount),
     failedRequests: roundCount(serverErrorCount),
     clientErrorRequests: roundCount(clientErrorCount),
+    successfulRequests: null,
     monitoringCoveragePercent:
       Number.isFinite(monitoringCoveragePercent) &&
       monitoringCoveragePercent >= 0 &&
@@ -152,6 +153,9 @@ export function createErrorRateMeasurement({
 
   return {
     ...base,
+    successfulRequests: roundCount(
+      Math.max(0, requestCount - serverErrorCount - clientErrorCount),
+    ),
     status: 'measured',
     errorRatePercent:
       Math.round((serverErrorCount / requestCount) * 100 * 10000) / 10000,

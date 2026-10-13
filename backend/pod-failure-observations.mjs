@@ -14,6 +14,42 @@ export function isPodReady(pod) {
   return readyCondition?.status === 'True'
 }
 
+export function describePodFailureExecutionError(
+  error,
+  failureInjectionAttempted = false,
+) {
+  const causeCode = error?.cause?.code || error?.code || null
+  const message =
+    error instanceof Error ? error.message : String(error)
+  const isFetchFailure =
+    message.toLowerCase() === 'fetch failed' ||
+    typeof causeCode === 'string' &&
+      ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT'].includes(
+        causeCode,
+      )
+
+  if (!isFetchFailure) {
+    return {
+      statusCode: 500,
+      error: 'Failed to execute pod failure experiment',
+      details: message,
+    }
+  }
+
+  const transportDetail = causeCode
+    ? ` (${causeCode})`
+    : ''
+  const injectionDetail = failureInjectionAttempted
+    ? ' The pod deletion request was sent but its outcome could not be confirmed; inspect the pod in Kubernetes before retrying.'
+    : ''
+  return {
+    statusCode: 503,
+    error: 'Kubernetes API connection failed',
+    details:
+      `The ChaosGuard backend could not complete a request to the Kubernetes API${transportDetail}. Verify the backend kubeconfig and network access to the cluster.${injectionDetail}`,
+  }
+}
+
 export function isTargetPodFailureObserved(pods, podName) {
   return observeTargetPodFailure(pods, podName).observed
 }
@@ -84,7 +120,11 @@ export function inferReadinessTimings(experiment) {
     return { detectionTimeMs: null, recoveryTimeMs: null }
   }
 
-  const startedAt = Date.parse(experiment.startedAt)
+  const experimentStartedAt = Date.parse(experiment.startedAt)
+  const failureInjectedAt = Date.parse(experiment.failureInjectedAt)
+  const startedAt = Number.isFinite(failureInjectedAt)
+    ? failureInjectedAt
+    : experimentStartedAt
   const completedAt = Date.parse(experiment.completedAt)
   if (
     !Number.isFinite(startedAt) ||
@@ -140,8 +180,8 @@ export function inferReadinessTimings(experiment) {
     recoveryTimeMs:
       firstFailureAt !== null &&
       recoveredAt !== null &&
-      recoveredAt >= firstFailureAt
-        ? recoveredAt - firstFailureAt
+      recoveredAt >= startedAt
+        ? recoveredAt - startedAt
         : null,
   }
 }

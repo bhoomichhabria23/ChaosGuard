@@ -23,18 +23,30 @@ import * as k8s from '@kubernetes/client-node'
 import axios from 'axios'
 import {
   calculateResilienceScore,
+  getResilienceScoreTargets,
   measureAvailability,
 } from './resilience-score.mjs'
 import {
   buildHttpErrorRateQueries,
   createErrorRateMeasurement,
 } from './prometheus-observations.mjs'
-import { createHttpTrafficProbe } from './http-traffic-probe.mjs'
+import {
+  createHttpTrafficProbe,
+  measureHttpResponseBaseline,
+} from './http-traffic-probe.mjs'
 import {
   findRecoveredReplacementPod,
+  describePodFailureExecutionError,
   isPodReady,
   observeTargetPodFailure,
 } from './pod-failure-observations.mjs'
+import {
+  measureReadinessRecovery,
+  measureStressDetection,
+  parseCpuQuantity,
+  parseMemoryQuantity,
+  utilizationPercent,
+} from './stress-metrics.mjs'
 
 dotenv.config({
   path: fileURLToPath(new URL('./.env', import.meta.url)),
@@ -133,12 +145,18 @@ const httpTrafficProbeTargets = {
 }
 
 function startHttpTrafficProbe(target) {
+  return createHttpTrafficProbe(
+    createHttpTrafficRequest(target),
+  )
+}
+
+function createHttpTrafficRequest(target) {
   const service = httpTrafficProbeTargets[target]
   if (!service) {
     throw new Error(`No HTTP traffic probe route is configured for ${target}`)
   }
 
-  return createHttpTrafficProbe(async () => {
+  return async () => {
     try {
       const result =
         await kubeApi.connectGetNamespacedServiceProxyWithPathWithHttpInfo(
@@ -155,7 +173,11 @@ function startHttpTrafficProbe(target) {
       }
       throw error
     }
-  })
+  }
+}
+
+function measureHttpResponseBaselineForTarget(target) {
+  return measureHttpResponseBaseline(createHttpTrafficRequest(target))
 }
 
 function hasValidTrafficProbeOption(input) {
@@ -319,6 +341,58 @@ async function recordExperiment(
   if (trafficProbe) {
     experiment.httpTrafficProbeMeasurement =
       await trafficProbe.stop()
+  } else if (!experiment.httpTrafficProbeMeasurement) {
+    experiment.httpTrafficProbeMeasurement = {
+      enabled: false,
+      responseTimeSamplesMs: [],
+      averageResponseTimeMs: null,
+      reason: 'The HTTP traffic probe was disabled for this experiment.',
+    }
+  }
+  if (experiment.httpTrafficProbeMeasurement) {
+    experiment.averageResponseTimeMs =
+      experiment.httpTrafficProbeMeasurement.averageResponseTimeMs
+  }
+
+  const baselineResponseMeasurement =
+    experiment.baselineResponseTimeMeasurement || null
+  experiment.responseTimeMeasurement = {
+    source: 'kubernetes-service-proxy-http-probe',
+    status:
+      baselineResponseMeasurement?.status === 'measured' &&
+      Number.isFinite(experiment.averageResponseTimeMs) &&
+      experiment.averageResponseTimeMs > 0
+        ? 'measured'
+        : 'unavailable',
+    baselineResponseTimeMs:
+      baselineResponseMeasurement?.status === 'measured'
+        ? baselineResponseMeasurement.responseTimeMs
+        : null,
+    averageResponseTimeMs:
+      Number.isFinite(experiment.averageResponseTimeMs) &&
+      experiment.averageResponseTimeMs > 0
+        ? experiment.averageResponseTimeMs
+        : null,
+    baselineSampleCount: baselineResponseMeasurement?.sampleCount ?? 0,
+    experimentSampleCount:
+      experiment.httpTrafficProbeMeasurement?.responseTimeSamplesMs?.length ?? 0,
+    reason:
+      baselineResponseMeasurement?.reason ||
+      (baselineResponseMeasurement?.status !== 'measured'
+        ? 'No successful baseline HTTP response was measured.'
+        : !Number.isFinite(experiment.averageResponseTimeMs) ||
+            experiment.averageResponseTimeMs <= 0
+          ? experiment.httpTrafficProbeMeasurement?.reason ||
+            'No valid HTTP response-time samples were measured during the experiment.'
+          : null),
+  }
+
+  if (
+    experiment.type === 'cpu-stress' ||
+    experiment.type === 'memory-stress'
+  ) {
+    experiment.detectionMeasurement =
+      measureStressDetection(experiment, getResilienceScoreTargets())
   }
 
   experiment.availabilityMeasurement =
@@ -352,8 +426,46 @@ async function recordExperiment(
   } else {
     await saveExperiments()
   }
-
   return experiment
+}
+
+async function getNodeAllocatableCapacity(pod) {
+  const nodeName = pod?.spec?.nodeName
+  if (!nodeName) {
+    return {
+      status: 'unavailable',
+      reason: 'The target pod has no assigned Kubernetes node.',
+    }
+  }
+
+  try {
+    const node = await kubeApi.readNode({ name: nodeName })
+    const allocatable = node.status?.allocatable
+    const cpuCores = parseCpuQuantity(allocatable?.cpu)
+    const memoryBytes = parseMemoryQuantity(allocatable?.memory)
+    return {
+      status: cpuCores !== null && memoryBytes !== null
+        ? 'measured'
+        : 'unavailable',
+      source: 'kubernetes-node-status-allocatable',
+      nodeName,
+      cpuCores,
+      memoryBytes,
+      reason: cpuCores === null || memoryBytes === null
+        ? 'Kubernetes did not return valid node allocatable CPU and memory capacity.'
+        : null,
+    }
+  } catch (error) {
+    console.error(`Unable to read allocatable capacity for node ${nodeName}:`, error)
+    return {
+      status: 'unavailable',
+      source: 'kubernetes-node-status-allocatable',
+      nodeName,
+      cpuCores: null,
+      memoryBytes: null,
+      reason: 'Kubernetes node allocatable capacity could not be read.',
+    }
+  }
 }
 
 async function collectErrorRateMeasurement(experiment) {
@@ -560,6 +672,26 @@ async function recordReadinessObservation(
   }
 }
 
+async function measureServiceRecovery({
+  target,
+  samples,
+  expectedReplicaCount,
+  stressEndedAt,
+}) {
+  return measureReadinessRecovery({
+    afterTimestamp: stressEndedAt,
+    sample: async () => {
+      const previousSampleCount = samples.length
+      await recordReadinessObservation(
+        target,
+        samples,
+        expectedReplicaCount,
+      )
+      return samples.length > previousSampleCount ? samples.at(-1) : null
+    },
+  })
+}
+
 function startReadinessSampling(
   target,
   samples,
@@ -610,6 +742,7 @@ function appendReadinessObservation(
       readyPods: 0,
       totalPods: 0,
       serviceHealthy: false,
+      oomKilledContainers: [],
       recordedAt:
         new Date().toISOString()
     })
@@ -637,9 +770,43 @@ function appendReadinessObservation(
         ? [{ podId, restartCount }]
         : []
     }),
+    oomKilledContainers: pods.flatMap((pod) =>
+      (pod.status?.containerStatuses || [])
+        .filter(
+          (status) =>
+            status.lastState?.terminated?.reason === 'OOMKilled' &&
+            typeof (pod.metadata?.uid || pod.metadata?.name) === 'string' &&
+            typeof status.name === 'string' &&
+            Number.isSafeInteger(status.restartCount) &&
+            status.restartCount > 0,
+        )
+        .map((status) => ({
+          podId: pod.metadata.uid || pod.metadata.name,
+          containerName: status.name,
+          restartCount: status.restartCount,
+          finishedAt: status.lastState.terminated.finishedAt || null,
+          reason: 'OOMKilled',
+        })),
+    ),
     recordedAt:
       new Date().toISOString()
   })
+}
+
+function collectObservedOomKilledContainers(readinessSamples) {
+  const observations = new Map()
+  for (const sample of readinessSamples || []) {
+    for (const observation of sample.oomKilledContainers || []) {
+      const key = [
+        observation.podId,
+        observation.containerName,
+        observation.restartCount,
+        observation.finishedAt || '',
+      ].join(':')
+      observations.set(key, observation)
+    }
+  }
+  return [...observations.values()]
 }
 
 async function getCurrentPodName(
@@ -850,7 +1017,7 @@ async function getPodCpuUsageByPod(
   podName
 ) {
   const query =
-    `rate(container_cpu_usage_seconds_total{namespace="default",pod="${podName}"}[1m])`
+    `sum(rate(container_cpu_usage_seconds_total{namespace="default",pod="${podName}"}[1m]))`
 
   const response =
     await axios.get(
@@ -1022,6 +1189,7 @@ async function runCpuStress(
       reject
     ) => {
       let completed = false
+      let timeoutId
 
       const finishSuccess =
         () => {
@@ -1032,6 +1200,7 @@ async function runCpuStress(
           }
 
           completed = true
+          clearTimeout(timeoutId)
           resolve()
         }
 
@@ -1044,8 +1213,19 @@ async function runCpuStress(
           }
 
           completed = true
+          clearTimeout(timeoutId)
           reject(error)
         }
+
+      timeoutId = setTimeout(
+        () =>
+          finishFailure(
+            new Error(
+              `CPU stress command exceeded its ${durationMs + 10000} ms safety timeout`,
+            ),
+          ),
+        durationMs + 10000,
+      )
 
       try {
         const result =
@@ -1224,7 +1404,7 @@ async function runMemoryStress(
   const command = [
     'node',
     '-e',
-    `const memory=Buffer.alloc(${memoryBytes},1);setTimeout(()=>console.log(memory.length),${durationMs});`
+    `const memory=Buffer.alloc(${memoryBytes},1);setTimeout(()=>{memory.fill(0);process.exit(0)},${durationMs});`
   ]
 
   const stdout =
@@ -1244,6 +1424,7 @@ async function runMemoryStress(
       reject
     ) => {
       let completed = false
+      let timeoutId
 
       const finishSuccess =
         () => {
@@ -1252,6 +1433,7 @@ async function runMemoryStress(
           }
 
           completed = true
+          clearTimeout(timeoutId)
           resolve()
         }
 
@@ -1262,8 +1444,19 @@ async function runMemoryStress(
           }
 
           completed = true
+          clearTimeout(timeoutId)
           reject(error)
         }
+
+      timeoutId = setTimeout(
+        () =>
+          finishFailure(
+            new Error(
+              `Memory stress command exceeded its ${durationMs + 10000} ms safety timeout`,
+            ),
+          ),
+        durationMs + 10000,
+      )
 
       try {
         const result =
@@ -1281,9 +1474,20 @@ async function runMemoryStress(
                 status?.status ===
                 'Failure'
               ) {
+                const failureDetails = [
+                  status.reason,
+                  status.message,
+                  Number.isFinite(status.code)
+                    ? `exit code ${status.code}`
+                    : null,
+                ].filter(Boolean)
                 finishFailure(
                   new Error(
-                    `Memory stress command failed for ${safeMemoryMb} MB`
+                    `Memory stress command failed for ${safeMemoryMb} MB${
+                      failureDetails.length
+                        ? `: ${failureDetails.join('; ')}`
+                        : ''
+                    }`
                   )
                 )
 
@@ -2602,6 +2806,7 @@ const server =
           '/api/chaos/pod-failure'
       ) {
         let trafficProbe = null
+        let failureInjectionAttempted = false
         try {
           const input =
             await readBody(
@@ -2709,6 +2914,14 @@ const server =
             )
           }
 
+          const baselineResponseTimeMeasurement =
+            input.enableHttpTrafficProbe === false
+              ? {
+                  status: 'unavailable',
+                  responseTimeMs: null,
+                  reason: 'The HTTP traffic probe was disabled for this experiment.',
+                }
+              : await measureHttpResponseBaselineForTarget(target)
           const startedAt =
             new Date().toISOString()
 
@@ -2737,6 +2950,7 @@ const server =
           const failureStartedAt =
             Date.now()
 
+          failureInjectionAttempted = true
           await kubeApi.deleteNamespacedPod(
             {
               name: podName,
@@ -2784,6 +2998,9 @@ const server =
               status:
                 'detection-timeout',
               readyBefore,
+              baselineResponseTimeMeasurement,
+              failureInjectedAt:
+                new Date(failureStartedAt).toISOString(),
               readinessSamples,
               restartCountBefore,
               restartCountAfter: null,
@@ -2792,10 +3009,21 @@ const server =
               completedAt:
                 detectedAt,
               detectedAt,
-              detectionTimeMs:
-                detection.elapsedMs,
+              detectionTimeMs: null,
+              detectionMeasurement: {
+                status: 'not-detected',
+                detectionTimeMs: null,
+                source: 'kubernetes-api-target-pod-observation',
+                reason: 'Kubernetes did not confirm the selected pod failure before the detection timeout.',
+              },
               recoveryTimeMs:
                 null,
+              recoveryMeasurement: {
+                status: 'unavailable',
+                recoveryTimeMs: null,
+                source: 'kubernetes-api-pod-readiness',
+                reason: 'Failure detection timed out, so recovery was not measured.',
+              },
               totalExperimentTimeMs:
                 Date.now() -
                 startTime
@@ -2874,14 +3102,32 @@ const server =
               status:
                 'recovery-timeout',
               readyBefore,
+              baselineResponseTimeMeasurement,
+              failureInjectedAt:
+                new Date(failureStartedAt).toISOString(),
               startedAt,
               completedAt:
                 recoveredAt,
               detectedAt,
               recoveredAt,
               detectionTimeMs,
+              detectionMeasurement: {
+                status: 'measured',
+                detectionTimeMs,
+                source: 'kubernetes-api-target-pod-observation',
+                unhealthyCondition: detection.failureObservation.reason,
+                detectedAt,
+                reason: null,
+              },
               recoveryTimeMs:
-                Date.now() - failureStartedAt,
+                null,
+              recoveryMeasurement: {
+                status: 'recovery-timeout',
+                recoveryTimeMs: null,
+                source: 'kubernetes-api-pod-readiness',
+                timeoutMs: 60000,
+                reason: `The service did not return to ${expectedReadyPodCount} ready pods within 60000 ms after pod deletion.`,
+              },
               totalExperimentTimeMs:
                 Date.now() -
                 startTime
@@ -2953,13 +3199,31 @@ const server =
             status:
               'completed',
             readyBefore,
+            baselineResponseTimeMeasurement,
+            failureInjectedAt:
+              new Date(failureStartedAt).toISOString(),
             startedAt,
             completedAt:
               recoveredAt,
             detectedAt,
             recoveredAt,
             detectionTimeMs,
+            detectionMeasurement: {
+              status: 'measured',
+              detectionTimeMs,
+              source: 'kubernetes-api-target-pod-observation',
+              unhealthyCondition: detection.failureObservation.reason,
+              detectedAt,
+              reason: null,
+            },
             recoveryTimeMs,
+            recoveryMeasurement: {
+              status: 'measured',
+              recoveryTimeMs,
+              source: 'kubernetes-api-pod-readiness',
+              recoveredAt,
+              reason: null,
+            },
             totalExperimentTimeMs
           }
 
@@ -2988,15 +3252,15 @@ const server =
             error
           )
 
+          const failure =
+            describePodFailureExecutionError(
+              error,
+              failureInjectionAttempted,
+            )
           return respond(
             response,
-            500,
-            {
-              error:
-                'Failed to execute pod failure experiment',
-              details:
-                error.message
-            }
+            failure.statusCode,
+            failure,
           )
         }
       }
@@ -3022,6 +3286,7 @@ const server =
       ) {
         let stopReadinessSampling
         let trafficProbe = null
+        let stressHttpTrafficProbeMeasurement = null
         try {
           const input =
             await readBody(
@@ -3128,6 +3393,15 @@ const server =
             getPodRestartCount(
               initialPod
             )
+          const targetContainerName =
+            await getTargetContainerName(
+              target,
+              podName
+            )
+          const resourceCapacity =
+            await getNodeAllocatableCapacity(
+              initialPod
+            )
           const readinessSamples = []
 
           await recordReadinessObservation(
@@ -3140,24 +3414,22 @@ const server =
             await getPodCpuUsageByPod(
               podName
             )
+          const baselineMemoryBytes =
+            targetContainerName
+              ? await getPodMemoryUsageByPod(
+                  podName,
+                  targetContainerName
+                )
+              : null
 
-          if (
-            baselineCpu ===
-              null ||
-            Number.isNaN(
-              baselineCpu
-            )
-          ) {
-            return respond(
-              response,
-              503,
-              {
-                error:
-                  'Prometheus CPU metric is not available for the target pod'
-              }
-            )
-          }
-
+          const baselineResponseTimeMeasurement =
+            input.enableHttpTrafficProbe === false
+              ? {
+                  status: 'unavailable',
+                  responseTimeMs: null,
+                  reason: 'The HTTP traffic probe was disabled for this experiment.',
+                }
+              : await measureHttpResponseBaselineForTarget(target)
           const startedAt =
             new Date().toISOString()
 
@@ -3187,10 +3459,8 @@ const server =
               durationMs
             )
 
-          let peakCpu =
-            baselineCpu
-
           const samples = []
+          const cpuMemorySamples = []
 
           /*
            * Sample real Prometheus CPU
@@ -3214,28 +3484,31 @@ const server =
               1000
             )
 
-            const cpu =
-              await getPodCpuUsageByPod(
-                podName
-              )
+            const [cpu, memoryBytes] = await Promise.all([
+              getPodCpuUsageByPod(podName),
+              targetContainerName
+                ? getPodMemoryUsageByPod(podName, targetContainerName)
+                : null,
+            ])
 
             if (
               cpu !== null &&
-              !Number.isNaN(cpu)
+              Number.isFinite(cpu)
             ) {
               samples.push({
                 cpu,
                 recordedAt:
                   new Date().toISOString()
               })
-
-              if (
-                cpu >
-                peakCpu
-              ) {
-                peakCpu =
-                  cpu
-              }
+            }
+            if (
+              memoryBytes !== null &&
+              Number.isFinite(memoryBytes)
+            ) {
+              cpuMemorySamples.push({
+                memoryBytes,
+                recordedAt: new Date().toISOString(),
+              })
             }
           }
 
@@ -3246,22 +3519,31 @@ const server =
 
           await stressPromise
 
-          /*
-           * Give Prometheus time to publish
-           * the latest CPU observation.
-           */
+           const stressEndedAt = new Date().toISOString()
+           if (trafficProbe) {
+             stressHttpTrafficProbeMeasurement = await trafficProbe.stop()
+             trafficProbe = null
+           }
+           await stopReadinessSampling()
+           stopReadinessSampling = null
+           const recoveryMeasurement = await measureServiceRecovery({
+             target,
+             samples: readinessSamples,
+             expectedReplicaCount: initialPods.length,
+             stressEndedAt,
+           })
 
-          await sleep(
-            2000
-          )
-
-          const postStressCpu =
+           const postStressCpu =
             await getPodCpuUsageByPod(
               podName
             )
-
-          await stopReadinessSampling()
-          stopReadinessSampling = null
+          const postStressMemoryBytes =
+            targetContainerName
+              ? await getPodMemoryUsageByPod(
+                  podName,
+                  targetContainerName
+                )
+              : null
 
           const finalPods =
             await getPodsForService(
@@ -3278,28 +3560,48 @@ const server =
               finalPod
             )
 
-          /*
-           * Include the post-stress
-           * measurement in the peak if
-           * it is higher than the sampled
-           * values.
-           */
-
+          const inStressSampleCount = samples.length
           if (
             postStressCpu !== null &&
-            !Number.isNaN(
-              postStressCpu
-            ) &&
-            postStressCpu >
-              peakCpu
+            Number.isFinite(postStressCpu)
           ) {
-            peakCpu =
-              postStressCpu
+            samples.push({
+              cpu: postStressCpu,
+              recordedAt: new Date().toISOString(),
+            })
+          }
+          if (
+            postStressMemoryBytes !== null &&
+            Number.isFinite(postStressMemoryBytes)
+          ) {
+            cpuMemorySamples.push({
+              memoryBytes: postStressMemoryBytes,
+              recordedAt: new Date().toISOString(),
+            })
           }
 
+          const hasCpuSamples = samples.length > 0
+          const observedCpuValues = samples
+            .map(({ cpu }) => cpu)
+            .filter((cpu) => Number.isFinite(cpu) && cpu >= 0)
+          if (Number.isFinite(baselineCpu) && baselineCpu >= 0) {
+            observedCpuValues.push(baselineCpu)
+          }
+          const peakCpu = observedCpuValues.length > 0
+            ? Math.max(...observedCpuValues)
+            : null
+          const peakMemoryBytes = cpuMemorySamples.length > 0
+            ? Math.max(
+                ...cpuMemorySamples.map(({ memoryBytes }) => memoryBytes),
+              )
+            : null
+
           const cpuIncrease =
-            peakCpu -
-            baselineCpu
+            peakCpu === null ||
+            !Number.isFinite(baselineCpu) ||
+            baselineCpu < 0
+              ? null
+              : peakCpu - baselineCpu
 
           const totalExperimentTimeMs =
             Date.now() -
@@ -3312,9 +3614,16 @@ const server =
             target,
             podName,
             status:
-              'completed',
+              recoveryMeasurement.status === 'recovery-timeout'
+                ? 'recovery-timeout'
+                : 'completed',
             readyBefore,
+            baselineResponseTimeMeasurement,
+            httpTrafficProbeMeasurement:
+              stressHttpTrafficProbeMeasurement,
             readinessSamples,
+            oomKilledObservations:
+              collectObservedOomKilledContainers(readinessSamples),
             restartCountBefore,
             restartCountAfter,
             stressDurationMs:
@@ -3323,8 +3632,52 @@ const server =
             peakCpu,
             postStressCpu,
             cpuIncrease,
+            baselineMemoryBytes,
+            peakMemoryBytes,
+            postStressMemoryBytes,
+            cpuUtilizationPercent:
+              utilizationPercent(peakCpu, resourceCapacity.cpuCores),
+            memoryUtilizationPercent:
+              utilizationPercent(peakMemoryBytes, resourceCapacity.memoryBytes),
+            cpuUtilizationMeasurement: {
+              source: 'prometheus-pod-cpu-and-kubernetes-node-allocatable',
+              denominator: 'node-allocatable-cpu',
+              nodeName: resourceCapacity.nodeName || null,
+              usageCores: peakCpu,
+              capacityCores: resourceCapacity.cpuCores ?? null,
+              reason: peakCpu === null
+                ? 'No valid Prometheus CPU usage sample was recorded.'
+                : resourceCapacity.cpuCores === null
+                  ? resourceCapacity.reason
+                  : null,
+            },
+            memoryUtilizationMeasurement: {
+              source: 'prometheus-pod-memory-and-kubernetes-node-allocatable',
+              denominator: 'node-allocatable-memory',
+              nodeName: resourceCapacity.nodeName || null,
+              usageBytes: peakMemoryBytes,
+              capacityBytes: resourceCapacity.memoryBytes ?? null,
+              reason: peakMemoryBytes === null
+                ? 'No valid Prometheus memory usage sample was recorded.'
+                : resourceCapacity.memoryBytes === null
+                  ? resourceCapacity.reason
+                  : null,
+            },
+            recoveryMeasurement,
+            stressEndedAt,
+            cpuMemorySamples,
             cpuSamples:
               samples,
+            measurementStatus:
+              hasCpuSamples
+                ? 'measured'
+                : 'unavailable',
+            measurementReason:
+              !hasCpuSamples
+                ? 'Prometheus returned no CPU samples during or after the stress window; peak usage and increase were not calculated.'
+                : inStressSampleCount === 0
+                  ? 'No CPU samples were recorded during the active stress window; values use the real post-stress Prometheus observation.'
+                  : null,
             startedAt,
             completedAt:
               new Date().toISOString(),
@@ -3342,7 +3695,9 @@ const server =
             201,
             {
               message:
-                `CPU stress experiment completed successfully for ${target}`,
+                inStressSampleCount > 0
+                  ? `CPU stress experiment completed for ${target}`
+                  : `CPU stress experiment completed for ${target}, but Prometheus returned no CPU samples during the stress window.`,
               experiment
             }
           )
@@ -3392,6 +3747,7 @@ if (
 ) {
   let stopReadinessSampling
   let trafficProbe = null
+  let stressHttpTrafficProbeMeasurement = null
   try {
     const input =
       await readBody(
@@ -3510,6 +3866,10 @@ if (
       getPodRestartCount(
         initialPod
       )
+    const resourceCapacity =
+      await getNodeAllocatableCapacity(
+        initialPod
+      )
     const readinessSamples = []
 
     await recordReadinessObservation(
@@ -3540,6 +3900,10 @@ if (
         podName,
         containerName
       )
+    const baselineCpu =
+      await getPodCpuUsageByPod(
+        podName
+      )
 
     if (
       baselineMemoryBytes ===
@@ -3558,6 +3922,14 @@ if (
       )
     }
 
+    const baselineResponseTimeMeasurement =
+      input.enableHttpTrafficProbe === false
+        ? {
+            status: 'unavailable',
+            responseTimeMs: null,
+            reason: 'The HTTP traffic probe was disabled for this experiment.',
+          }
+        : await measureHttpResponseBaselineForTarget(target)
     const startedAt =
       new Date().toISOString()
 
@@ -3584,10 +3956,8 @@ if (
         memoryMb
       )
 
-    let peakMemoryBytes =
-      baselineMemoryBytes
-
     const samples = []
+    const cpuSamples = []
 
     let stressCompleted =
       false
@@ -3604,17 +3974,14 @@ if (
     )
 
     while (!stressCompleted) {
-      const memoryBytes =
-        await getPodMemoryUsageByPod(
-          podName,
-          containerName
-        )
+      const [memoryBytes, cpu] = await Promise.all([
+        getPodMemoryUsageByPod(podName, containerName),
+        getPodCpuUsageByPod(podName),
+      ])
 
       if (
         memoryBytes !== null &&
-        !Number.isNaN(
-          memoryBytes
-        )
+        Number.isFinite(memoryBytes)
       ) {
         samples.push({
           memoryBytes,
@@ -3625,13 +3992,12 @@ if (
             new Date().toISOString()
         })
 
-        if (
-          memoryBytes >
-          peakMemoryBytes
-        ) {
-          peakMemoryBytes =
-            memoryBytes
-        }
+      }
+      if (cpu !== null && Number.isFinite(cpu)) {
+        cpuSamples.push({
+          cpu,
+          recordedAt: new Date().toISOString(),
+        })
       }
 
       if (!stressCompleted) {
@@ -3643,18 +4009,29 @@ if (
 
     await stressPromise
 
-    await sleep(
-      2000
-    )
+    const stressEndedAt = new Date().toISOString()
+    if (trafficProbe) {
+      stressHttpTrafficProbeMeasurement = await trafficProbe.stop()
+      trafficProbe = null
+    }
+    await stopReadinessSampling()
+    stopReadinessSampling = null
+    const recoveryMeasurement = await measureServiceRecovery({
+      target,
+      samples: readinessSamples,
+      expectedReplicaCount: initialPods.length,
+      stressEndedAt,
+    })
 
     const postStressMemoryBytes =
       await getPodMemoryUsageByPod(
         podName,
         containerName
       )
-
-    await stopReadinessSampling()
-    stopReadinessSampling = null
+    const postStressCpu =
+      await getPodCpuUsageByPod(
+        podName
+      )
 
     const finalPods =
       await getPodsForService(
@@ -3671,22 +4048,38 @@ if (
         finalPod
       )
 
+    const inStressSampleCount = samples.length
     if (
-      postStressMemoryBytes !==
-        null &&
-      !Number.isNaN(
-        postStressMemoryBytes
-      ) &&
-      postStressMemoryBytes >
-        peakMemoryBytes
+      postStressMemoryBytes !== null &&
+      Number.isFinite(postStressMemoryBytes)
     ) {
-      peakMemoryBytes =
-        postStressMemoryBytes
+      samples.push({
+        memoryBytes: postStressMemoryBytes,
+        memoryMb: postStressMemoryBytes / (1024 * 1024),
+        recordedAt: new Date().toISOString(),
+      })
+    }
+    if (postStressCpu !== null && Number.isFinite(postStressCpu)) {
+      cpuSamples.push({
+        cpu: postStressCpu,
+        recordedAt: new Date().toISOString(),
+      })
     }
 
+    const peakMemoryBytes = inStressSampleCount > 0
+      ? Math.max(
+          baselineMemoryBytes,
+          ...samples.slice(0, inStressSampleCount).map(({ memoryBytes }) => memoryBytes),
+        )
+      : null
+
     const memoryIncreaseBytes =
-      peakMemoryBytes -
-      baselineMemoryBytes
+      peakMemoryBytes === null
+        ? null
+        : peakMemoryBytes - baselineMemoryBytes
+    const peakCpu = cpuSamples.length > 0
+      ? Math.max(...cpuSamples.map(({ cpu }) => cpu))
+      : null
 
     const totalExperimentTimeMs =
       Date.now() -
@@ -3704,10 +4097,18 @@ if (
       podName,
 
       status:
-        'completed',
+        recoveryMeasurement.status === 'recovery-timeout'
+          ? 'recovery-timeout'
+          : inStressSampleCount > 0
+            ? 'completed'
+            : 'measurement-incomplete',
 
       readyBefore,
+      baselineResponseTimeMeasurement,
+      httpTrafficProbeMeasurement: stressHttpTrafficProbeMeasurement,
       readinessSamples,
+      oomKilledObservations:
+        collectObservedOomKilledContainers(readinessSamples),
       restartCountBefore,
       restartCountAfter,
 
@@ -3726,8 +4127,9 @@ if (
       peakMemoryBytes,
 
       peakMemoryMb:
-        peakMemoryBytes /
-        (1024 * 1024),
+        peakMemoryBytes === null
+          ? null
+          : peakMemoryBytes / (1024 * 1024),
 
       postStressMemoryBytes,
 
@@ -3741,11 +4143,54 @@ if (
       memoryIncreaseBytes,
 
       memoryIncreaseMb:
-        memoryIncreaseBytes /
-        (1024 * 1024),
+        memoryIncreaseBytes === null
+          ? null
+          : memoryIncreaseBytes / (1024 * 1024),
 
+      baselineCpu,
+      peakCpu,
+      postStressCpu,
+      cpuUtilizationPercent:
+        utilizationPercent(peakCpu, resourceCapacity.cpuCores),
+      memoryUtilizationPercent:
+        utilizationPercent(peakMemoryBytes, resourceCapacity.memoryBytes),
+      cpuUtilizationMeasurement: {
+        source: 'prometheus-pod-cpu-and-kubernetes-node-allocatable',
+        denominator: 'node-allocatable-cpu',
+        nodeName: resourceCapacity.nodeName || null,
+        usageCores: peakCpu,
+        capacityCores: resourceCapacity.cpuCores ?? null,
+        reason: peakCpu === null
+          ? 'No valid Prometheus CPU usage sample was recorded.'
+          : resourceCapacity.cpuCores === null
+            ? resourceCapacity.reason
+            : null,
+      },
+      memoryUtilizationMeasurement: {
+        source: 'prometheus-pod-memory-and-kubernetes-node-allocatable',
+        denominator: 'node-allocatable-memory',
+        nodeName: resourceCapacity.nodeName || null,
+        usageBytes: peakMemoryBytes,
+        capacityBytes: resourceCapacity.memoryBytes ?? null,
+        reason: peakMemoryBytes === null
+          ? 'No valid Prometheus memory usage sample was recorded.'
+          : resourceCapacity.memoryBytes === null
+            ? resourceCapacity.reason
+            : null,
+      },
+      recoveryMeasurement,
+      stressEndedAt,
+      cpuSamples,
       memorySamples:
         samples,
+      measurementStatus:
+        inStressSampleCount > 0
+          ? 'measured'
+          : 'unavailable',
+      measurementReason:
+        inStressSampleCount > 0
+          ? null
+          : 'Prometheus returned no memory samples during the stress window; peak usage and increase were not calculated.',
 
       startedAt,
 
@@ -3766,7 +4211,9 @@ if (
       201,
       {
         message:
-          `Memory stress experiment completed successfully for ${target}`,
+          inStressSampleCount > 0
+            ? `Memory stress experiment completed for ${target}`
+            : `Memory workload ran for ${target}, but Prometheus returned no samples during the stress window.`,
 
         experiment
       }

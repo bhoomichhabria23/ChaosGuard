@@ -1,12 +1,45 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  describePodFailureExecutionError,
   findRecoveredReplacementPod,
   inferReadinessTimings,
   isPodReady,
   observeTargetPodFailure,
   isTargetPodFailureObserved,
 } from '../pod-failure-observations.mjs'
+
+test('Kubernetes transport failures identify the backend connectivity problem', () => {
+  const failure = describePodFailureExecutionError(
+    Object.assign(new TypeError('fetch failed'), {
+      cause: { code: 'ECONNREFUSED' },
+    }),
+  )
+  assert.equal(failure.statusCode, 503)
+  assert.equal(failure.error, 'Kubernetes API connection failed')
+  assert.match(failure.details, /ECONNREFUSED/)
+  assert.match(failure.details, /backend kubeconfig and network access/)
+  assert.doesNotMatch(failure.details, /token|password|secret/i)
+})
+
+test('uncertain deletion transport failure warns operators to check pod state', () => {
+  const failure = describePodFailureExecutionError(
+    new TypeError('fetch failed'),
+    true,
+  )
+  assert.equal(failure.statusCode, 503)
+  assert.match(failure.details, /outcome could not be confirmed/)
+  assert.match(failure.details, /before retrying/)
+})
+
+test('non-transport pod failure errors retain their actual failure reason', () => {
+  const failure = describePodFailureExecutionError(
+    new Error('Pod is not schedulable'),
+  )
+  assert.equal(failure.statusCode, 500)
+  assert.equal(failure.error, 'Failed to execute pod failure experiment')
+  assert.equal(failure.details, 'Pod is not schedulable')
+})
 
 function pod(name, { ready = true, phase = 'Running', deleting = false } = {}) {
   return {
@@ -113,7 +146,7 @@ test('readiness timestamps provide real timings when legacy detection timed out'
   })
 
   assert.equal(timings.detectionTimeMs, 7984)
-  assert.equal(timings.recoveryTimeMs, 5872)
+  assert.equal(timings.recoveryTimeMs, 13856)
 })
 
 test('readiness timings require observed healthy-to-unhealthy and unhealthy-to-healthy transitions', () => {

@@ -7,6 +7,13 @@ import {
   LockKeyhole, LogOut, Menu, MoreHorizontal, Play, Plus, Search,
   Pencil, Server, Settings, Shield, ShieldCheck, Trash2, UserRound, Users, X, Zap,
 } from 'lucide-react'
+import {
+  formatAvailabilityEvidence,
+  formatComponentScore,
+  formatResilienceScore,
+  formatSuccessfulRequestEvidence,
+  getScoreDisplayPercent,
+} from './resilience-score-display.js'
 import './theme.css'
 import './console.css'
 
@@ -110,7 +117,7 @@ const API_BASE = (
   (import.meta.env.PROD ? 'https://chaosguard-backend.onrender.com' : '')
 ).trim().replace(/\/+$/, '')
 const serviceNames = ['user-service', 'order-service', 'payment-service', 'notification-service']
-const N_A = 'N/A'
+const N_A = 'Pending'
 
 async function apiRequest(path, options = {}) {
   let response
@@ -162,30 +169,119 @@ function formatValue(value, suffix = '') {
   return value === null || value === undefined || value === '' ? N_A : `${value}${suffix}`
 }
 
+function hasDisplayValue(value) {
+  return value !== null &&
+    value !== undefined &&
+    value !== '' &&
+    value !== N_A &&
+    (typeof value !== 'number' || Number.isFinite(value))
+}
+
+function formatStressMeasurement(value, unit, zeroDescription) {
+  if (!Number.isFinite(value)) return null
+  if (value === 0) return zeroDescription
+  const formatted = unit === 'cores'
+    ? Number(value).toPrecision(4)
+    : Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 })
+  return `${formatted} ${unit}`
+}
+
+function getStressMeasurementFields(experiment) {
+  const scoreMeasurements = experiment.scoreMeasurements || {}
+  const fields = experiment.type === 'cpu-stress'
+    ? [
+        ['Stress duration', formatValue(experiment.stressDurationMs, ' ms')],
+        ['Baseline CPU', formatStressMeasurement(experiment.baselineCpu, 'cores', 'No CPU usage observed')],
+        ['Peak CPU', formatStressMeasurement(experiment.peakCpu, 'cores', 'No CPU usage observed')],
+        ['Post-stress CPU', formatStressMeasurement(experiment.postStressCpu, 'cores', 'No CPU usage observed')],
+        ['CPU increase', formatStressMeasurement(experiment.cpuIncrease, 'cores', 'No increase observed')],
+        ['CPU utilization (node capacity)', formatValue(experiment.cpuUtilizationPercent, ' %')],
+        ['Memory utilization (node capacity)', formatValue(experiment.memoryUtilizationPercent, ' %')],
+      ]
+    : [
+        ['Requested memory', formatValue(experiment.requestedMemoryMb, ' MB')],
+        ['Stress duration', formatValue(experiment.stressDurationMs, ' ms')],
+        ['Baseline memory', formatStressMeasurement(experiment.baselineMemoryMb, 'MB', 'No memory usage observed')],
+        ['Peak memory', formatStressMeasurement(experiment.peakMemoryMb, 'MB', 'No memory usage observed')],
+        ['Post-stress memory', formatStressMeasurement(experiment.postStressMemoryMb, 'MB', 'No memory usage observed')],
+        ['Memory increase', formatStressMeasurement(experiment.memoryIncreaseMb, 'MB', 'No increase observed')],
+        ['CPU utilization (node capacity)', formatValue(experiment.cpuUtilizationPercent, ' %')],
+        ['Memory utilization (node capacity)', formatValue(experiment.memoryUtilizationPercent, ' %')],
+      ]
+
+  return [
+    ...fields,
+    ['Availability', formatAvailabilityEvidence(scoreMeasurements.availabilityPercent)],
+    ['Baseline response time', formatValue(scoreMeasurements.baselineResponseTimeMs, ' ms')],
+    ['Average response time', formatValue(scoreMeasurements.averageResponseTimeMs, ' ms')],
+    ['Response-time degradation', formatValue(scoreMeasurements.responseTimeDegradationPercent, ' %')],
+    ['Successful requests', formatSuccessfulRequestEvidence(
+      scoreMeasurements.successfulRequests,
+      scoreMeasurements.totalRequests,
+    )],
+    ['Total requests', formatValue(scoreMeasurements.totalRequests)],
+    ['Baseline successful requests', formatValue(scoreMeasurements.baselineSuccessfulRequests)],
+    ['Baseline request total', formatValue(scoreMeasurements.baselineTotalRequests)],
+    ['Baseline error rate', formatValue(scoreMeasurements.baselineErrorRatePercent, ' %')],
+    ['Pod restart delta', formatValue(scoreMeasurements.restartCountDelta)],
+    ['Observed OOMKilled terminations', formatValue(
+      scoreMeasurements.readinessObservationCount > 0
+        ? scoreMeasurements.oomKilledObservations?.length
+        : null,
+    )],
+    ['Recovery time', formatValue(scoreMeasurements.recoveryTimeMs, ' ms')],
+    ['Resilience score', formatResilienceScore(experiment.resilienceScore)],
+    ['Measurement status', experiment.measurementStatus],
+    ['Measurement note', experiment.measurementReason],
+    ['CPU utilization basis', experiment.cpuUtilizationMeasurement?.denominator],
+    ['Memory utilization basis', experiment.memoryUtilizationMeasurement?.denominator],
+    ['Recovery measurement note', experiment.recoveryMeasurement?.reason],
+    ['Detection measurement note', experiment.detectionMeasurement?.reason],
+  ].filter(([, value]) => hasDisplayValue(value))
+}
+
 const scoreMetricDetails = [
-  { key: 'recovery', label: 'Recovery time', measurement: 'recoveryTimeMs', unit: ' ms', icon: Clock3 },
-  { key: 'detection', label: 'Detection time', measurement: 'detectionTimeMs', unit: ' ms', icon: Activity },
   { key: 'availability', label: 'Availability', measurement: 'availabilityPercent', unit: ' %', icon: Gauge },
-  { key: 'stability', label: 'Pod stability', measurement: 'restartCountDelta', unit: ' restarts', icon: ShieldCheck },
+  { key: 'performance', label: 'Performance', measurement: 'averageResponseTimeMs', unit: ' ms', icon: Activity },
+  { key: 'errorHandling', label: 'Error handling', measurement: 'successfulRequests', unit: ' successful requests', icon: ShieldCheck },
+  { key: 'detection', label: 'Detection time', measurement: 'detectionTimeMs', unit: ' ms', icon: Bell },
+  { key: 'recovery', label: 'Recovery time', measurement: 'recoveryTimeMs', unit: ' ms', icon: Clock3 },
 ]
 
+function scoreMeasurementEvidence(key, measurements) {
+  if (key === 'availability') {
+    return formatAvailabilityEvidence(measurements.availabilityPercent)
+  }
+  if (key === 'performance') {
+    const actual = Number.isFinite(measurements.averageResponseTimeMs)
+      ? `${measurements.averageResponseTimeMs.toFixed(2)} ms`
+      : 'Pending'
+    const baseline = Number.isFinite(measurements.baselineResponseTimeMs)
+      ? `${measurements.baselineResponseTimeMs.toFixed(2)} ms`
+      : 'Pending'
+    return `${actual} · baseline ${baseline}`
+  }
+  if (key === 'errorHandling') {
+    return formatSuccessfulRequestEvidence(
+      measurements.successfulRequests,
+      measurements.totalRequests,
+    )
+  }
+  const value = measurements[`${key}TimeMs`]
+  return Number.isFinite(value) && value > 0
+    ? `${value.toFixed(2)} ms`
+    : 'Pending'
+}
+
 function ResilienceScorePanel({ experiment }) {
-  if (!experiment) return null
-  const measurements = experiment.scoreMeasurements || {}
+  if (!experiment || !['pod-failure', 'cpu-stress', 'memory-stress'].includes(experiment.type)) return null
   const breakdown = experiment.scoreBreakdown || {}
+  const measurements = experiment.scoreMeasurements || {}
   const overallScore = experiment.resilienceScore
   const hasOverallScore = Number.isFinite(overallScore) && overallScore >= 0 && overallScore <= 100
+  const overallDisplayScore = getScoreDisplayPercent(overallScore)
   const scorePieCircumference = 2 * Math.PI * 40
-  const scorePieOffset = scorePieCircumference * (1 - (hasOverallScore ? overallScore : 0) / 100)
-  const isPodFailure = experiment.type === 'pod-failure'
-  const restartMeasurement = measurements.restartCountDelta === null || measurements.restartCountDelta === undefined
-    ? formatValue(measurements.podRestartCount, ' replacement pod restarts')
-    : formatValue(measurements.restartCountDelta, ' restarts')
-  const stabilityEvidence = measurements.podStabilityMeasurement
-  const visibleMissingMetrics = experiment.missingMetrics || []
-  const stabilityMeasurement = isPodFailure && stabilityEvidence?.status === 'measured'
-    ? `${restartMeasurement} · ${formatValue(stabilityEvidence.disruptionCount, ' pod disruptions')}`
-    : restartMeasurement
+  const scorePieOffset = scorePieCircumference * (1 - (overallDisplayScore ?? 0) / 100)
 
   return <section className="panel score-breakdown-panel">
     <div className="score-panel-topline">
@@ -204,31 +300,27 @@ function ResilienceScorePanel({ experiment }) {
           <span className="score-meta-divider" />
           <time>{experiment.completedAt || experiment.startedAt || N_A}</time>
         </p>
-        {experiment.scoreUnavailableReason && <p className="score-unavailable-reason">{experiment.scoreUnavailableReason}</p>}
       </div>
-      <div className="score-pie-summary" aria-label={hasOverallScore ? `Resilience score ${overallScore} out of 100` : 'Resilience score unavailable'}>
+      <div className="score-pie-summary" aria-label="Resilience score">
         <svg viewBox="0 0 92 92" aria-hidden="true">
           <circle className="score-pie-track" cx="46" cy="46" r="40" />
           {hasOverallScore && <circle className="score-pie-value" cx="46" cy="46" r="40" strokeDasharray={scorePieCircumference} strokeDashoffset={scorePieOffset} />}
         </svg>
         <div className="score-pie-label">
-          <strong>{hasOverallScore ? `${overallScore}%` : N_A}</strong>
+          <strong>{formatResilienceScore(overallScore)}</strong>
         </div>
         <span className="score-pie-caption">RESILIENCE</span>
       </div>
     </div>
     <div className="score-metric-grid">
-      {scoreMetricDetails.map(({ key, label, measurement, unit, icon: Icon }, index) => {
-        const value = key === 'stability'
-          ? stabilityMeasurement
-          : formatValue(measurements[measurement], unit)
+      {scoreMetricDetails.map(({ key, label, icon: Icon }, index) => {
         const score = breakdown[key]
         const configuredWeight = experiment.scoreWeights?.[key]
-        const effectiveWeight = experiment.effectiveScoreWeights?.[key]
         const hasScore = Number.isFinite(score) && score >= 0 && score <= 100
-        const measurementStatus =
-          measurements.metricMeasurementStatus?.[key] ||
-          (hasScore ? 'measured' : 'unavailable')
+        const displayScore = getScoreDisplayPercent(score)
+        const effectiveWeight = experiment.effectiveScoreWeights?.[key]
+        const hasEffectiveWeight =
+          hasOverallScore && Number.isFinite(effectiveWeight)
         return <div className="score-metric" key={key} style={{ '--metric-order': index }}>
           <div className="score-metric-head">
             <span className={`score-metric-icon score-metric-icon-${key}`}><Icon size={16} /></span>
@@ -236,23 +328,16 @@ function ResilienceScorePanel({ experiment }) {
             <span className="score-metric-weight">{formatValue(configuredWeight, '%')} weight</span>
           </div>
           <div className="score-metric-result">
-            <strong>{hasScore ? `${score}%` : N_A}</strong>
-            {effectiveWeight !== undefined && <span>{effectiveWeight}% effective</span>}
-            {effectiveWeight === undefined && <span className="score-metric-excluded">Not scored</span>}
+            <strong>{formatComponentScore(score)}</strong>
+            {hasEffectiveWeight && <span>{effectiveWeight}% effective</span>}
           </div>
           <div className="score-metric-progress" aria-hidden="true">
-            <span style={{ width: hasScore ? `${score}%` : '0%' }} />
+            {hasScore && <span style={{ width: `${displayScore}%` }} />}
           </div>
-          <small><span>{String(measurementStatus).replaceAll('-', ' ').toUpperCase()}</span>{value}</small>
+          <small>{scoreMeasurementEvidence(key, measurements)}</small>
         </div>
       })}
     </div>
-    {visibleMissingMetrics.length > 0 && <div className="score-missing">
-      <b>Unavailable metrics</b>
-      <ul>{visibleMissingMetrics.map((metric) => <li key={metric}>
-        <span>{scoreMetricDetails.find((item) => item.key === metric)?.label || metric}:</span> {experiment.missingMetricReasons?.[metric] || 'No valid measurement was recorded.'}
-      </li>)}</ul>
-    </div>}
   </section>
 }
 
@@ -271,7 +356,7 @@ function ServicesPage({ onNavigate }) {
 }
 
 function ExperimentsPage({ onConfigure, onNavigate, history }) {
-  return <><PageHeader eyebrow="SAFE BY DESIGN · GUARDED EXECUTION" title="Chaos experiments" description="Run real Kubernetes experiments and inspect actual Prometheus measurements." action={<button className="button-primary" onClick={() => onConfigure(experiments[0])}><Plus size={15} /> New experiment</button>} /><div className="experiment-intro"><div className="experiment-intro-icon"><ShieldCheck size={18} /></div><div><b>Experiments run against the real backend</b><span>No simulated metrics are displayed.</span></div><button onClick={() => onNavigate('history')}>View history <ArrowRight size={13} /></button></div><div className="experiment-cards">{experiments.map(({ icon: Icon, ...experiment }, index) => <article className={`panel experiment-card exp-${experiment.color}`} key={experiment.id}><div className="experiment-card-top"><span className="experiment-icon"><Icon size={20} /></span><span className="experiment-number">0{index + 1}</span></div><div className="section-kicker">{experiment.category}</div><h2>{experiment.name}</h2><p>{experiment.description}</p><div className="experiment-meta"><span><ShieldCheck size={13} /> Guardrails included</span><span><Clock3 size={13} /> Backend measured</span></div><button className="button-secondary" onClick={() => onConfigure(experiment)}>Configure experiment <ArrowRight size={14} /></button></article>)}</div><section className="panel recent-experiment-panel"><div className="panel-heading"><div><h2>Recent experiments</h2><p>Actual results from the backend</p></div><button className="text-action" onClick={() => onNavigate('history')}>View history <ArrowRight size={13} /></button></div>{history.slice(0, 3).map((row) => <div className="recent-exp-row" key={row.id}><span className="recent-exp-icon"><FlaskConical size={14} /></span><div><b>{experimentLabel(row.type)}</b><span>{row.target} · {row.startedAt || N_A}</span></div><span className="status-tag"><i />{row.status}</span><span className="recent-score">{row.resilienceScore === null || row.resilienceScore === undefined ? N_A : `${row.resilienceScore}%`}</span></div>)}</section></>
+  return <><PageHeader eyebrow="SAFE BY DESIGN · GUARDED EXECUTION" title="Chaos experiments" description="Run real Kubernetes experiments and inspect actual Prometheus measurements." action={<button className="button-primary" onClick={() => onConfigure(experiments[0])}><Plus size={15} /> New experiment</button>} /><div className="experiment-intro"><div className="experiment-intro-icon"><ShieldCheck size={18} /></div><div><b>Experiments run against the real backend</b><span>No simulated metrics are displayed.</span></div><button onClick={() => onNavigate('history')}>View history <ArrowRight size={13} /></button></div><div className="experiment-cards">{experiments.map(({ icon: Icon, ...experiment }, index) => <article className={`panel experiment-card exp-${experiment.color}`} key={experiment.id}><div className="experiment-card-top"><span className="experiment-icon"><Icon size={20} /></span><span className="experiment-number">0{index + 1}</span></div><div className="section-kicker">{experiment.category}</div><h2>{experiment.name}</h2><p>{experiment.description}</p><div className="experiment-meta"><span><ShieldCheck size={13} /> Guardrails included</span><span><Clock3 size={13} /> Backend measured</span></div><button className="button-secondary" onClick={() => onConfigure(experiment)}>Configure experiment <ArrowRight size={14} /></button></article>)}</div><section className="panel recent-experiment-panel"><div className="panel-heading"><div><h2>Recent experiments</h2><p>Actual results from the backend</p></div><button className="text-action" onClick={() => onNavigate('history')}>View history <ArrowRight size={13} /></button></div>{history.slice(0, 3).map((row) => <div className="recent-exp-row" key={row.id}><span className="recent-exp-icon"><FlaskConical size={14} /></span><div><b>{experimentLabel(row.type)}</b><span>{row.target} · {row.startedAt || N_A}</span></div><span className="status-tag"><i />{row.status}</span>  <span className="recent-score">{formatResilienceScore(row.resilienceScore)}</span></div>)}</section></>
 }
 
 function ConfigurationPage({ experiment, onBack, onRun }) {
@@ -535,7 +620,7 @@ function ExperimentReportChart({ experiment }) {
   return <div className="report-plot-wrap">
     <div className="report-plot-header">
       <div className="section-kicker">RECORDED EXPERIMENT DATA</div>
-      <span>{title}{isPodFailure && data.length === 0 ? '' : ` · ${data.length} samples`}</span>
+      <span>{title}{data.length > 0 ? ` · ${data.length} samples` : ''}</span>
     </div>
     {data.length > 0
       ? <ExperimentSampleChart data={data} isPodFailure={isPodFailure} title={title} unit={unit} />
@@ -548,18 +633,38 @@ function ExperimentReportChart({ experiment }) {
 function ResultPage({ onNavigate, onConfigure, experiment }) {
   const isPod = experiment.type === 'pod-failure'
   const isCpu = experiment.type === 'cpu-stress'
-  const values = isPod ? [['Experiment ID', experiment.id], ['Target service', experiment.target], ['Old pod name', experiment.podName], ['Replacement pod name', experiment.replacementPodName], ['Status', experiment.status], ['Readiness before', experiment.readyBefore], ['Detection time', formatValue(experiment.detectionTimeMs, ' ms')], ['Recovery time', formatValue(experiment.recoveryTimeMs, ' ms')], ['Total experiment time', formatValue(experiment.totalExperimentTimeMs, ' ms')]] : [['Target service', experiment.target], ['Pod name', experiment.podName], ['Status', experiment.status], [isCpu ? 'Stress duration' : 'Requested memory', isCpu ? formatValue(experiment.stressDurationMs, ' ms') : formatValue(experiment.requestedMemoryMb, ' MB')], ...(isCpu ? [['Baseline CPU', experiment.baselineCpu], ['Peak CPU', experiment.peakCpu], ['Post-stress CPU', experiment.postStressCpu], ['CPU increase', experiment.cpuIncrease]] : [['Baseline memory', formatValue(experiment.baselineMemoryMb, ' MB')], ['Peak memory', formatValue(experiment.peakMemoryMb, ' MB')], ['Post-stress memory', formatValue(experiment.postStressMemoryMb, ' MB')], ['Memory increase', formatValue(experiment.memoryIncreaseMb, ' MB')], ['Stress duration', formatValue(experiment.stressDurationMs, ' ms')]]), ['Started', experiment.startedAt], ['Completed', experiment.completedAt], ['Total experiment time', formatValue(experiment.totalExperimentTimeMs, ' ms')]]
+  const values = (isPod
+    ? [
+        ['Experiment ID', experiment.id],
+        ['Target service', experiment.target],
+        ['Old pod name', experiment.podName],
+        ['Replacement pod name', experiment.replacementPodName],
+        ['Status', experiment.status],
+        ['Readiness before', experiment.readyBefore],
+        ['Detection time', formatValue(experiment.detectionTimeMs, ' ms')],
+        ['Recovery time', formatValue(experiment.recoveryTimeMs, ' ms')],
+        ['Total experiment time', formatValue(experiment.totalExperimentTimeMs, ' ms')],
+      ]
+    : [
+        ['Target service', experiment.target],
+        ['Pod name', experiment.podName],
+        ['Status', experiment.status],
+        ...getStressMeasurementFields(experiment),
+        ['Started', experiment.startedAt],
+        ['Completed', experiment.completedAt],
+        ['Total experiment time', formatValue(experiment.totalExperimentTimeMs, ' ms')],
+      ]).filter(([, value]) => hasDisplayValue(value))
   return <>
     <div className="back-link-row"><button className="back-link" onClick={() => onNavigate('history')}><ArrowLeft size={14} /> Experiment history</button><span>/</span><span>Backend result</span></div>
     <div className="result-header panel">
       <div className={`result-check ${experiment.status === 'completed' ? '' : 'result-check-failed'}`}>{experiment.status === 'completed' ? <Check size={22} /> : <X size={22} />}</div>
       <div className="result-title">
-        <div className="section-kicker">EXPERIMENT {experiment.status?.toUpperCase() || N_A}</div>
+        <div className="section-kicker">EXPERIMENT {experiment.status?.toUpperCase() || 'UNKNOWN'}</div>
         <h1>{experimentLabel(experiment.type)}</h1>
-        <p>{experiment.target || N_A} · {experiment.completedAt || experiment.startedAt || N_A}</p>
+        <p>{[experiment.target, experiment.completedAt || experiment.startedAt].filter(hasDisplayValue).join(' · ')}</p>
       </div>
     </div>
-    <ResilienceScorePanel experiment={experiment} />
+    {(isPod || isCpu || experiment.type === 'memory-stress') && <ResilienceScorePanel experiment={experiment} />}
     <div className="result-metrics">{values.slice(0, 5).map(([label, value], index) => <MetricCard key={label} icon={index === 0 ? Activity : Server} label={label} value={formatValue(value)} note="Backend value" color={['blue', 'violet', 'cyan', 'amber', 'green'][index]} />)}</div>
     <section className="panel recovery-panel">
       <div className="panel-heading"><div><h2>Actual experiment result</h2><p>Returned by the Node.js backend</p></div></div>
@@ -587,8 +692,8 @@ function HistoryPage({ history, onOpenResult }) {
           <span className="history-target">{formatValue(row.target)}</span>
           <span className="history-date">{formatValue(row.startedAt)}</span>
           <span className="history-duration">{formatValue(row.totalExperimentTimeMs, ' ms')}</span>
-          <span className={`status-tag ${row.status === 'failed' ? 'status-failed' : ''}`}><i />{formatValue(row.status)}</span>
-          <span className="history-score">{row.resilienceScore === null || row.resilienceScore === undefined ? N_A : `${row.resilienceScore}%`}</span>
+          <span className={`status-tag ${row.status !== 'completed' ? 'status-failed' : ''}`}><i />{formatValue(row.status)}</span>
+          <span className="history-score">{formatResilienceScore(row.resilienceScore)}</span>
           <ArrowRight size={14} aria-hidden="true" />
         </button>)}
         {!filtered.length && <p className="empty-state">No backend experiments found.</p>}
@@ -643,13 +748,14 @@ function ReportsPage({ history, user, onDeleteReport }) {
       ['Total experiment time', formatValue(item.totalExperimentTimeMs, ' ms')]
     ]
     if (item.type === 'pod-failure') return [['Experiment ID', item.id], ...fields, ['Replacement pod', item.replacementPodName], ['Readiness before', item.readyBefore], ['Detection time', formatValue(item.detectionTimeMs, ' ms')], ['Recovery time', formatValue(item.recoveryTimeMs, ' ms')]]
-    if (item.type === 'cpu-stress') return [...fields, ['Stress duration', formatValue(item.stressDurationMs, ' ms')], ['Baseline CPU', item.baselineCpu], ['Peak CPU', item.peakCpu], ['Post-stress CPU', item.postStressCpu], ['CPU increase', item.cpuIncrease], ['Actual CPU samples', item.cpuSamples?.length ?? 0]]
-    return [...fields, ['Requested memory', formatValue(item.requestedMemoryMb, ' MB')], ['Stress duration', formatValue(item.stressDurationMs, ' ms')], ['Baseline memory', formatValue(item.baselineMemoryMb, ' MB')], ['Peak memory', formatValue(item.peakMemoryMb, ' MB')], ['Post-stress memory', formatValue(item.postStressMemoryMb, ' MB')], ['Memory increase', formatValue(item.memoryIncreaseMb, ' MB')], ['Actual memory samples', item.memorySamples?.length ?? 0]]
+    if (item.type === 'cpu-stress' || item.type === 'memory-stress') return [...fields, ...getStressMeasurementFields(item)]
+    return fields
   }
   const reportMarkup = (item, index = 0) => {
-    return <article className="report-detail-card"><div className="report-detail-heading"><span className="history-exp-icon"><FlaskConical size={15} /></span><div><div className="section-kicker">EXPERIMENT {String(index + 1).padStart(2, '0')}</div><h3>{experimentLabel(item.type)}</h3></div><span className={`status-tag ${item.status === 'failed' ? 'status-failed' : ''}`}><i />{formatValue(item.status)}</span></div><div className="report-field-grid">{getReportFields(item).map(([label, value]) => <div key={label}><span>{label}</span><b>{formatValue(value)}</b></div>)}</div><ExperimentReportChart experiment={item} /></article>
+    const reportFields = getReportFields(item).filter(([, value]) => hasDisplayValue(value))
+    return <article className="report-detail-card"><div className="report-detail-heading"><span className="history-exp-icon"><FlaskConical size={15} /></span><div><div className="section-kicker">EXPERIMENT {String(index + 1).padStart(2, '0')}</div><h3>{experimentLabel(item.type)}</h3></div><span className={`status-tag ${item.status !== 'completed' ? 'status-failed' : ''}`}><i />{formatValue(item.status)}</span></div><div className="report-field-grid">{reportFields.map(([label, value]) => <div key={label}><span>{label}</span><b>{formatValue(value)}</b></div>)}</div><ExperimentReportChart experiment={item} /></article>
   }
-  return <><div className="report-list-screen"><PageHeader eyebrow="BACKEND RESULTS" title="Reports & analytics" description="Download a structured PDF for each completed experiment." /><section className="panel report-document"><div className="report-document-header"><div><div className="section-kicker">CHAOSGUARD · EXPERIMENT REPORTS</div><h2>Experiment results</h2><p>Select an experiment to download only its report.</p></div><div className="report-document-meta"><span>Experiments</span><b>{history.length}</b></div></div>{history.length ? <div className="report-summary-table">{history.map((item, index) => <div className="report-summary-row" key={item.id}><span className="report-summary-name"><b>{String(index + 1).padStart(2, '0')} · {experimentLabel(item.type)}</b></span><span>{formatValue(item.target)}</span><span className={`status-tag ${item.status === 'failed' ? 'status-failed' : ''}`}><i />{formatValue(item.status)}</span><span>{formatValue(item.totalExperimentTimeMs, ' ms')}</span><div className="report-row-actions"><button className="button-secondary report-row-download" onClick={() => downloadReport(item)}><Download size={13} /> PDF</button><button className="report-row-delete" aria-label={`Delete ${experimentLabel(item.type)} report`} title="Delete report" onClick={() => onDeleteReport(item)}><Trash2 size={14} /><span>Delete</span></button></div></div>)}</div> : <p className="empty-state">No backend experiments found.</p>}<p className="report-document-note">Each PDF contains only the selected experiment and its backend-returned values.</p></section></div>{printReport && <section className="report-print-document"><div className="report-print-header"><div className="section-kicker">CHAOSGUARD · EXPERIMENT REPORT</div><h1>{experimentLabel(printReport.type)}</h1></div>{reportMarkup(printReport, history.findIndex((item) => item.id === printReport.id))}<p className="report-document-note">Only values returned by the backend are included. Unavailable metrics are shown as N/A.</p></section>}</>
+  return <><div className="report-list-screen"><PageHeader eyebrow="BACKEND RESULTS" title="Reports & analytics" description="Download a structured PDF for each completed experiment." /><section className="panel report-document"><div className="report-document-header"><div><div className="section-kicker">CHAOSGUARD · EXPERIMENT REPORTS</div><h2>Experiment results</h2><p>Select an experiment to download only its report.</p></div><div className="report-document-meta"><span>Experiments</span><b>{history.length}</b></div></div>{history.length ? <div className="report-summary-table">{history.map((item, index) => <div className="report-summary-row" key={item.id}><span className="report-summary-name"><b>{String(index + 1).padStart(2, '0')} · {experimentLabel(item.type)}</b></span><span>{formatValue(item.target)}</span><span className={`status-tag ${item.status === 'failed' ? 'status-failed' : ''}`}><i />{formatValue(item.status)}</span><span>{formatValue(item.totalExperimentTimeMs, ' ms')}</span><div className="report-row-actions"><button className="button-secondary report-row-download" onClick={() => downloadReport(item)}><Download size={13} /> PDF</button><button className="report-row-delete" aria-label={`Delete ${experimentLabel(item.type)} report`} title="Delete report" onClick={() => onDeleteReport(item)}><Trash2 size={14} /><span>Delete</span></button></div></div>)}</div> : <p className="empty-state">No backend experiments found.</p>}<p className="report-document-note">Each PDF contains only the selected experiment and its backend-returned values.</p></section></div>{printReport && <section className="report-print-document"><div className="report-print-header"><div className="section-kicker">CHAOSGUARD · EXPERIMENT REPORT</div><h1>{experimentLabel(printReport.type)}</h1></div>{reportMarkup(printReport, history.findIndex((item) => item.id === printReport.id))}<p className="report-document-note">Only values returned by the backend are included. Pending measurements are omitted; no substitute values are shown.</p></section>}</>
 }
 
 
@@ -829,7 +935,12 @@ function SettingsPage({ onLogout, onToast, onUserUpdated, user }) {
         await loadHistory()
         setPage('result')
       } else {
-        setRunError(error.message)
+        const details = error.responseData?.details
+        setRunError(
+          details
+            ? `${error.message}: ${details}`
+            : error.message,
+        )
         setRunStatus('Failed')
       }
     }

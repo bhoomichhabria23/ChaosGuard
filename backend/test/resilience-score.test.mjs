@@ -2,55 +2,54 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   calculateResilienceScore,
+  getResilienceScoreTargets,
   measureAvailability,
-  measurePodStability,
   scoreAvailability,
   scoreDetection,
   scoreErrorRate,
+  scorePerformance,
   scoreRecovery,
-  scoreStability,
 } from '../resilience-score.mjs'
 
-test('recovery thresholds distinguish fast, slow, invalid, and failed recovery', () => {
-  assert.equal(scoreRecovery({ recoveryTimeMs: 1000 }), 100)
-  assert.equal(scoreRecovery({ recoveryTimeMs: 3000 }), 90)
-  assert.equal(scoreRecovery({ recoveryTimeMs: 5000 }), 80)
-  assert.equal(scoreRecovery({ recoveryTimeMs: 10000 }), 60)
-  assert.equal(scoreRecovery({ recoveryTimeMs: 20000 }), 40)
-  assert.equal(scoreRecovery({ recoveryTimeMs: 20001 }), 20)
-  assert.equal(scoreRecovery({ recoveryTimeMs: -1 }), null)
-  assert.equal(
-    scoreRecovery({ status: 'recovery-timeout', recoveryTimeMs: null }),
-    null,
-  )
-  assert.equal(scoreRecovery({ recoveryTimeMs: 4000 }, [
-    { maxMs: 1000, score: 95 },
-    { maxMs: null, score: 35 },
-  ]), 35)
-})
+function completeExperiment(overrides = {}) {
+  return {
+    type: 'cpu-stress',
+    status: 'completed',
+    readyBefore: true,
+    availabilityMeasurement: {
+      status: 'measured',
+      availabilityPercent: 96,
+      monitoringCoveragePercent: 100,
+    },
+    responseTimeMeasurement: {
+      status: 'measured',
+      baselineResponseTimeMs: 250,
+      averageResponseTimeMs: 1250,
+      reason: null,
+    },
+    errorRateMeasurement: {
+      status: 'measured',
+      totalRequests: 100,
+      successfulRequests: 90,
+      failedRequests: 5,
+      clientErrorRequests: 5,
+    },
+    detectionMeasurement: {
+      status: 'measured',
+      detectionTimeMs: 10000,
+      source: 'kubernetes-api-pod-readiness',
+    },
+    recoveryMeasurement: {
+      status: 'measured',
+      recoveryTimeMs: 20000,
+      source: 'kubernetes-api-pod-readiness',
+    },
+    ...overrides,
+  }
+}
 
-test('detection thresholds distinguish fast, slow, invalid, and failed detection', () => {
-  assert.equal(scoreDetection({ detectionTimeMs: 1000 }), 100)
-  assert.equal(scoreDetection({ detectionTimeMs: 3000 }), 90)
-  assert.equal(scoreDetection({ detectionTimeMs: 5000 }), 80)
-  assert.equal(scoreDetection({ detectionTimeMs: 10000 }), 60)
-  assert.equal(scoreDetection({ detectionTimeMs: 20000 }), 40)
-  assert.equal(scoreDetection({ detectionTimeMs: 20001 }), 20)
-  assert.equal(scoreDetection({ detectionTimeMs: -1 }), null)
-  assert.equal(
-    scoreDetection({ status: 'detection-timeout', detectionTimeMs: null }),
-    null,
-  )
-})
-
-test('availability score equals the measured percentage and rejects invalid observations', () => {
-  assert.equal(scoreAvailability(100), 100)
-  assert.equal(scoreAvailability(99), 99)
-  assert.equal(scoreAvailability(96), 96)
-  assert.equal(scoreAvailability(53.7), 53.7)
-  assert.equal(scoreAvailability(101), null)
-  assert.equal(scoreAvailability(null), null)
-  const measured = measureAvailability({
+test('availability is based on valid timestamped readiness checks and coverage', () => {
+  const measurement = measureAvailability({
     windowStart: '2026-01-01T00:00:00.000Z',
     windowEnd: '2026-01-01T00:00:02.000Z',
     readinessSamples: [
@@ -59,505 +58,313 @@ test('availability score equals the measured percentage and rejects invalid obse
       { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:02.000Z' },
     ],
   })
-  assert.equal(measured.status, 'measured')
-  assert.equal(measured.availabilityPercent, 50)
-  assert.equal(measured.validObservedDurationMs, 2000)
-  assert.equal(measured.monitoringCoveragePercent, 100)
-  assert.equal(measured.validSampleCount, 3)
-  assert.equal(measured.healthySampleCount, 2)
-  assert.equal(scoreAvailability(measured.availabilityPercent), 50)
-  assert.equal(
-    measureAvailability({
-      windowStart: '2026-01-01T00:00:00.000Z',
-      windowEnd: '2026-01-01T00:00:04.000Z',
-      readinessSamples: [
-        { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:00.000Z' },
-        { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:04.000Z' },
-      ],
-    }).status,
-    'insufficient-coverage',
-  )
-  assert.equal(
-    measureAvailability({
-      windowStart: '2026-01-01T00:00:00.000Z',
-      windowEnd: '2026-01-01T00:00:01.000Z',
-      readinessSamples: [
-        { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:00.000Z' },
-      ],
-    }).status,
-    'insufficient-samples',
-  )
-  const invalidWindow = measureAvailability({
-    windowStart: 'invalid',
-    windowEnd: '2026-01-01T00:00:01.000Z',
-    readinessSamples: [
-      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:00.000Z' },
-      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:01.000Z' },
-    ],
-  })
-  assert.equal(invalidWindow.status, 'unavailable')
-  assert.equal(invalidWindow.availabilityPercent, null)
-  const conflictingDuplicate = measureAvailability({
-    windowStart: '2026-01-01T00:00:00.000Z',
-    windowEnd: '2026-01-01T00:00:02.000Z',
-    readinessSamples: [
-      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:00.000Z' },
-      { readyPods: 0, totalPods: 1, recordedAt: '2026-01-01T00:00:00.000Z' },
-      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:01.000Z' },
-      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:02.000Z' },
-    ],
-  })
-  assert.equal(conflictingDuplicate.status, 'insufficient-coverage')
-  assert.equal(conflictingDuplicate.validSampleCount, 2)
-  assert.equal(
-    measureAvailability({
-      windowStart: '2026-01-01T00:00:00.000Z',
-      windowEnd: '2026-01-01T00:00:02.000Z',
-      readinessSamples: [
-        { readyPods: 0, totalPods: 0, recordedAt: '2026-01-01T00:00:00.000Z' },
-        { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:01.000Z' },
-        { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:02.000Z' },
-      ],
-    }).status,
-    'insufficient-coverage',
-  )
-  assert.equal(
-    scoreStability({ restartCountBefore: 2, restartCountAfter: 3 }),
-    70,
-  )
-  assert.equal(
-    scoreStability({ restartCountBefore: 3, restartCountAfter: 2 }),
-    null,
-  )
-  assert.equal(scoreStability({ podRestartCount: 4 }), 0)
-  assert.equal(
-    scoreStability({ restartCountBefore: 0.5, restartCountAfter: 1.5 }),
-    null,
-  )
-  assert.equal(scoreStability({}), null)
-})
-
-test('pod-failure stability counts the confirmed failed-pod replacement separately from restarts', () => {
-  const experiment = {
-    type: 'pod-failure',
-    status: 'completed',
-    podName: 'user-service-old',
-    failedPodUid: 'old-pod-uid',
-    failureObservation: { observed: true, reason: 'pod-absent' },
-    replacementPodName: 'user-service-new',
-    replacementPodUid: 'new-pod-uid',
-    readinessSamples: [
-      { podRestartCounts: [{ podId: 'survivor-uid', restartCount: 0 }] },
-      { podRestartCounts: [{ podId: 'survivor-uid', restartCount: 0 }] },
-    ],
-  }
-
-  const measurement = measurePodStability(experiment)
   assert.equal(measurement.status, 'measured')
-  assert.equal(measurement.restartCountDelta, 0)
-  assert.equal(measurement.failureEventCount, 1)
-  assert.equal(measurement.podReplacementObserved, true)
-  assert.equal(measurement.disruptionCount, 1)
-  assert.equal(scoreStability(experiment), 70)
+  assert.equal(measurement.availabilityPercent, 66.67)
+  assert.equal(measurement.validObservedDurationMs, 2000)
+  assert.equal(measurement.monitoringCoveragePercent, 100)
+  assert.equal(scoreAvailability(0), 0)
+  assert.equal(scoreAvailability(100), 100)
+  assert.equal(scoreAvailability(101), null)
+
+  const insufficientCoverage = measureAvailability({
+    windowStart: '2026-01-01T00:00:00.000Z',
+    windowEnd: '2026-01-01T00:00:04.000Z',
+    readinessSamples: [
+      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:00.000Z' },
+      { readyPods: 1, totalPods: 1, recordedAt: '2026-01-01T00:00:04.000Z' },
+    ],
+  })
+  assert.equal(insufficientCoverage.status, 'insufficient-coverage')
+  assert.equal(insufficientCoverage.availabilityPercent, null)
 })
 
-test('pod-failure stability uses restart observations from the same pod only', () => {
-  const experiment = {
-    type: 'pod-failure',
-    status: 'completed',
-    podName: 'deleted-target',
-    failedPodUid: 'old-pod-uid',
-    failureObservation: { observed: true, reason: 'pod-absent' },
-    replacementPodName: 'replacement',
-    replacementPodUid: 'replacement-pod-uid',
-    restartCountBefore: 4,
-    restartCountAfter: 0,
-    readinessSamples: [
-      {
-        podRestartCounts: [{ podId: 'old-pod-uid', restartCount: 4 }],
-      },
-      {
-        podRestartCounts: [{ podId: 'replacement-pod-uid', restartCount: 0 }],
-      },
-      {
-        podRestartCounts: [{ podId: 'replacement-pod-uid', restartCount: 1 }],
-      },
-    ],
-  }
+test('performance and time scores use measured baselines and configured targets', () => {
+  assert.equal(scorePerformance({
+    baselineResponseTimeMs: 100,
+    averageResponseTimeMs: 120,
+  }), 100)
+  assert.equal(scorePerformance({
+    baselineResponseTimeMs: 100,
+    averageResponseTimeMs: 200,
+  }), 60)
+  assert.equal(scorePerformance({
+    baselineResponseTimeMs: null,
+    averageResponseTimeMs: 100,
+  }), null)
+  assert.equal(scoreDetection({ detectionTimeMs: 500 }), 100)
+  assert.equal(scoreDetection({ detectionTimeMs: 2000 }), 50)
+  assert.equal(scoreRecovery({ recoveryTimeMs: 10000 }), 50)
+  assert.equal(scoreDetection({ detectionTimeMs: 0 }), null)
+  assert.equal(scoreDetection({ detectionTimeMs: -1 }), null)
+  assert.equal(scoreRecovery({ recoveryTimeMs: null }), null)
+  assert.equal(scoreRecovery({ status: 'recovery-timeout', recoveryTimeMs: 10000 }), null)
+  assert.equal(scoreDetection({ status: 'detection-timeout', detectionTimeMs: 500 }), null)
+  assert.equal(scoreErrorRate(10), 90)
+  assert.equal(scoreErrorRate(100), 0)
+  assert.equal(scoreErrorRate(-1), null)
+})
 
-  assert.equal(scoreStability(experiment), 40)
-  assert.deepEqual(measurePodStability(experiment), {
-    status: 'measured',
-    restartCountDelta: 1,
-    comparablePodCount: 1,
-    source: 'kubernetes-api-pod-observations',
-    failedPodName: 'deleted-target',
-    failedPodUid: 'old-pod-uid',
-    failureObserved: true,
-    replacementCandidatePodName: null,
-    replacementCandidatePodUid: null,
-    replacementCandidatePodReady: null,
-    failureEventCount: 1,
-    podReplacementObserved: true,
-    disruptionCount: 2,
-    restartMeasurementStatus: 'measured',
-    reason: null,
-    failureReason: 'pod-absent',
-    replacementPodName: 'replacement',
-    replacementPodUid: 'replacement-pod-uid',
+test('score targets are configurable and invalid values are rejected', () => {
+  const original = {
+    response: process.env.CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT,
+    detection: process.env.CHAOSGUARD_DETECTION_TARGET_MS,
+    recovery: process.env.CHAOSGUARD_RECOVERY_TARGET_MS,
+  }
+  try {
+    process.env.CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT = '35'
+    process.env.CHAOSGUARD_DETECTION_TARGET_MS = '4000'
+    process.env.CHAOSGUARD_RECOVERY_TARGET_MS = '9000'
+    assert.deepEqual(getResilienceScoreTargets(), {
+      responseTimeDegradationTolerancePercent: 35,
+      detectionTimeMs: 4000,
+      recoveryTimeMs: 9000,
+    })
+    process.env.CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT = '0'
+    assert.equal(
+      getResilienceScoreTargets().responseTimeDegradationTolerancePercent,
+      0,
+    )
+    process.env.CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT = '-1'
+    assert.throws(getResilienceScoreTargets, /non-negative percentage/)
+    process.env.CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT = '20'
+    process.env.CHAOSGUARD_RECOVERY_TARGET_MS = '0'
+    assert.throws(getResilienceScoreTargets, /must be configured as a positive/)
+  } finally {
+    for (const [key, value] of [
+      ['CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT', original.response],
+      ['CHAOSGUARD_DETECTION_TARGET_MS', original.detection],
+      ['CHAOSGUARD_RECOVERY_TARGET_MS', original.recovery],
+    ]) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
+test('moderate stress uses all five real component measurements and returns a percentage score', () => {
+  const result = calculateResilienceScore(completeExperiment())
+  assert.deepEqual(result.scoreBreakdown, {
+    availability: 96,
+    performance: 24,
+    errorHandling: 90,
+    detection: 10,
+    recovery: 25,
+  })
+  assert.equal(result.resilienceScore, 49)
+  assert.equal(result.scoreStatus, 'complete-real-metrics')
+  assert.deepEqual(result.scoreWeights, {
+    availability: 20,
+    performance: 20,
+    errorHandling: 20,
+    detection: 20,
+    recovery: 20,
+  })
+  assert.equal(result.scoreMeasurements.baselineResponseTimeMs, 250)
+  assert.equal(result.scoreMeasurements.acceptableResponseTimeMs, 300)
+  assert.equal(result.scoreMeasurements.responseTimeDegradationPercent, 400)
+  assert.equal(result.scoreMeasurements.successfulRequests, 90)
+  assert.equal(result.scoreMeasurements.totalRequests, 100)
+})
+
+test('normal operation scores from real passing measurements, not hardcoded experiment type values', () => {
+  const result = calculateResilienceScore(completeExperiment({
+    type: 'memory-stress',
+    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
+    responseTimeMeasurement: {
+      status: 'measured',
+      baselineResponseTimeMs: 80,
+      averageResponseTimeMs: 100,
+    },
+    errorRateMeasurement: {
+      status: 'measured',
+      successfulRequests: 30,
+      totalRequests: 30,
+    },
+    detectionMeasurement: { status: 'measured', detectionTimeMs: 1000 },
+    recoveryMeasurement: { status: 'measured', recoveryTimeMs: 2000 },
+  }))
+  assert.equal(result.resilienceScore, 99.2)
+  assert.deepEqual(Object.values(result.scoreBreakdown), [100, 96, 100, 100, 100])
+})
+
+test('severe stress lowers the score only through measured service impact and timing', () => {
+  const result = calculateResilienceScore(completeExperiment({
+    availabilityMeasurement: { status: 'measured', availabilityPercent: 20 },
+    responseTimeMeasurement: {
+      status: 'measured',
+      baselineResponseTimeMs: 100,
+      averageResponseTimeMs: 5000,
+    },
+    errorRateMeasurement: {
+      status: 'measured',
+      successfulRequests: 20,
+      totalRequests: 100,
+    },
+    detectionMeasurement: { status: 'measured', detectionTimeMs: 25000 },
+    recoveryMeasurement: { status: 'measured', recoveryTimeMs: 50000 },
+    cpuUtilizationPercent: 100,
+    memoryUtilizationPercent: 100,
+  }))
+  assert.deepEqual(result.scoreBreakdown, {
+    availability: 20,
+    performance: 2.4,
+    errorHandling: 20,
+    detection: 4,
+    recovery: 10,
+  })
+  assert.equal(result.resilienceScore, 11.28)
+})
+
+test('high CPU or memory usage alone does not alter the service resilience score', () => {
+  const healthy = completeExperiment()
+  const highUtilization = completeExperiment({
+    cpuUtilizationPercent: 100,
+    memoryUtilizationPercent: 150,
   })
   assert.equal(
-    calculateResilienceScore({
-      ...experiment,
-      status: 'detection-timeout',
-    }).scoreMeasurements.restartCountDelta,
-    1,
+    calculateResilienceScore(highUtilization).resilienceScore,
+    calculateResilienceScore(healthy).resilienceScore,
   )
 })
 
-test('pod-failure stability remains unscored without comparable pod observations', () => {
-  const experiment = {
+test('Pod Failure uses the same score components and keeps detection separate from recovery', () => {
+  const result = calculateResilienceScore(completeExperiment({
     type: 'pod-failure',
-    status: 'recovery-timeout',
-    podName: 'deleted-target',
-    failedPodUid: 'old-pod-uid',
-    failureObservation: { observed: true, reason: 'deletion-timestamp' },
-    restartCountBefore: 0,
-    restartCountAfter: 0,
-    podRestartCount: null,
-    readinessSamples: [
-      {
-        podRestartCounts: [{ podId: 'old-pod-uid', restartCount: 0 }],
-      },
-      {
-        podRestartCounts: [{ podId: 'replacement-pod-uid', restartCount: 0 }],
-      },
-    ],
-  }
-  const result = calculateResilienceScore({
-    ...experiment,
-    status: 'detection-timeout',
-  })
-
-  assert.equal(result.scoreBreakdown.stability, 70)
-  assert.equal(result.scoreMeasurements.restartCountDelta, null)
-  assert.equal(result.missingMetrics.includes('stability'), false)
-
-  assert.equal(
-    scoreStability({
-      type: 'pod-failure',
-      failureObservation: { observed: true, reason: 'pod-absent' },
-      podRestartCount: 0,
-      readinessSamples: [
-        { podRestartCounts: [] },
-        { podRestartCounts: [] },
-      ],
-    }),
-    70,
-  )
-  assert.equal(
-    scoreStability({
-      type: 'pod-failure',
-      failureObservation: { observed: true, reason: 'pod-absent' },
-      podRestartCount: 0,
-    }),
-    70,
-  )
+    detectionMeasurement: {
+      status: 'measured',
+      detectionTimeMs: 1000,
+      source: 'kubernetes-api-target-pod-observation',
+    },
+    recoveryMeasurement: {
+      status: 'measured',
+      recoveryTimeMs: 10000,
+      source: 'kubernetes-api-pod-readiness',
+    },
+  }))
+  assert.deepEqual(Object.keys(result.scoreBreakdown), [
+    'availability',
+    'performance',
+    'errorHandling',
+    'detection',
+    'recovery',
+  ])
+  assert.equal(result.scoreBreakdown.detection, 100)
+  assert.equal(result.scoreBreakdown.recovery, 50)
+  assert.equal(result.scoreMeasurements.detectionTimeMs, 1000)
+  assert.equal(result.scoreMeasurements.recoveryTimeMs, 10000)
+  assert.equal(result.resilienceScore, 72)
 })
 
-test('Pod Failure score accounts for readiness coverage and the real pod replacement', () => {
-  const result = calculateResilienceScore({
+test('reported Pod Failure measurements produce baseline-relative and stricter timing scores', () => {
+  const result = calculateResilienceScore(completeExperiment({
     type: 'pod-failure',
-    status: 'completed',
-    recoveryTimeMs: 8278,
-    detectionTimeMs: 92,
-    podName: 'user-service-old',
-    failedPodUid: 'old-pod-uid',
-    failureObservation: { observed: true, reason: 'pod-absent' },
-    replacementPodName: 'user-service-new',
-    replacementPodUid: 'new-pod-uid',
-    readinessSamples: [
-      { podRestartCounts: [{ podId: 'survivor-uid', restartCount: 0 }] },
-      { podRestartCounts: [{ podId: 'survivor-uid', restartCount: 0 }] },
-    ],
     availabilityMeasurement: {
       status: 'measured',
       availabilityPercent: 100,
-      monitoringCoveragePercent: 99.62,
-      healthyDurationMs: 8300,
-      validObservedDurationMs: 8300,
     },
-  })
-
-  assert.deepEqual(result.scoreBreakdown, {
-    recovery: 60,
-    detection: 100,
-    availability: 99.62,
-    stability: 70,
-  })
-  assert.equal(result.resilienceScore, 81.4)
-  assert.equal(result.scoreMeasurements.availabilityPercent, 100)
-  assert.equal(
-    result.scoreMeasurements.availabilityMeasurement.monitoringCoveragePercent,
-    99.62,
-  )
-  assert.equal(result.scoreMeasurements.podStabilityMeasurement.restartCountDelta, 0)
-  assert.equal(result.scoreMeasurements.podStabilityMeasurement.disruptionCount, 1)
-})
-
-test('pod-failure stability uses dynamic service and pod identities across all services', () => {
-  const targets = [
-    'user-service',
-    'order-service',
-    'payment-service',
-    'notification-service',
-  ]
-
-  for (const target of targets) {
-    const experiment = {
-      type: 'pod-failure',
-      target,
-      status: 'completed',
-      podName: `${target}-selected-random-pod`,
-      failedPodUid: `${target}-deleted-uid`,
-      failureObservation: {
-        observed: true,
-        reason: 'deletion-timestamp',
-      },
-      replacementPodName: `${target}-replacement-random-pod`,
-      replacementPodUid: `${target}-replacement-uid`,
-      readinessSamples: [
-        {
-          podRestartCounts: [
-            { podId: `${target}-deleted-uid`, restartCount: 3 },
-            { podId: `${target}-survivor-uid`, restartCount: 1 },
-          ],
-        },
-        {
-          podRestartCounts: [
-            { podId: `${target}-replacement-uid`, restartCount: 0 },
-            { podId: `${target}-survivor-uid`, restartCount: 2 },
-          ],
-        },
-      ],
-    }
-    const measurement = measurePodStability(experiment)
-    assert.equal(measurement.status, 'measured', target)
-    assert.equal(measurement.restartCountDelta, 1, target)
-    assert.equal(measurement.comparablePodCount, 1, target)
-    assert.equal(measurement.failedPodName, experiment.podName, target)
-    assert.equal(
-      measurement.replacementPodName,
-      experiment.replacementPodName,
-      target,
-    )
-    assert.equal(scoreStability(experiment), 40, target)
-  }
-})
-
-test('error-rate thresholds reject unmeasured and invalid values', () => {
-  assert.equal(scoreErrorRate(0.1), 100)
-  assert.equal(scoreErrorRate(1), 80)
-  assert.equal(scoreErrorRate(5), 60)
-  assert.equal(scoreErrorRate(10), 30)
-  assert.equal(scoreErrorRate(10.1), 0)
-  assert.equal(scoreErrorRate(null), null)
-  assert.equal(scoreErrorRate(-0.1), null)
-  assert.equal(scoreErrorRate(100.1), null)
-})
-
-test('configured weights follow the four-metric resilience formula', () => {
-  const result = calculateResilienceScore({
-    status: 'completed',
-    recoveryTimeMs: 500,
-    detectionTimeMs: 8000,
-    availabilityMeasurement: {
+    responseTimeMeasurement: {
       status: 'measured',
-      availabilityPercent: 40,
+      baselineResponseTimeMs: 22,
+      averageResponseTimeMs: 38.29,
     },
-    restartCountBefore: 0,
-    restartCountAfter: 1,
     errorRateMeasurement: {
       status: 'measured',
-      errorRatePercent: 0,
+      totalRequests: 9.37,
+      successfulRequests: 9.37,
     },
-  })
-
-  assert.equal(result.resilienceScore, 70.5)
+    detectionMeasurement: {
+      status: 'measured',
+      detectionTimeMs: 118,
+    },
+    recoveryMeasurement: {
+      status: 'measured',
+      recoveryTimeMs: 9319,
+    },
+  }))
   assert.deepEqual(result.scoreBreakdown, {
-    recovery: 100,
-    detection: 60,
-    availability: 40,
-    stability: 70,
+    availability: 100,
+    performance: 68.95,
+    errorHandling: 100,
+    detection: 100,
+    recovery: 53.65,
   })
-  assert.deepEqual(result.scoreWeights, {
-    recovery: 35,
-    detection: 25,
-    availability: 25,
-    stability: 15,
-  })
-  assert.deepEqual(result.effectiveScoreWeights, {
-    recovery: 35,
-    detection: 25,
-    availability: 25,
-    stability: 15,
-  })
-  assert.equal(result.scoreStatus, 'complete-real-metrics')
+  assert.equal(result.resilienceScore, 84.52)
+  assert.equal(result.scoreMeasurements.acceptableResponseTimeMs, 26.4)
 })
 
-test('partial scores normalize available configured weights and omit unavailable metrics', () => {
-  const result = calculateResilienceScore({
-    status: 'completed',
-    recoveryTimeMs: 500,
-    detectionTimeMs: 8000,
-  })
-
-  assert.equal(result.resilienceScore, 83.3)
-  assert.deepEqual(result.scoreBreakdown, {
-    recovery: 100,
-    detection: 60,
-    availability: null,
-    stability: null,
-  })
-  assert.equal(result.scoreWeights.recovery, 35)
-  assert.equal(result.scoreWeights.detection, 25)
-  assert.deepEqual(result.effectiveScoreWeights, {
-    recovery: 58.33,
-    detection: 41.67,
-  })
-  assert.equal(result.scoreStatus, 'partial-real-metrics')
-  assert.deepEqual(result.missingMetrics, [
-    'availability',
-    'stability',
-  ])
-  assert.equal(result.availableWeightPercent, 60)
-})
-
-test('insufficient measured metrics return a null score', () => {
-  const result = calculateResilienceScore({
-    status: 'completed',
-    detectionTimeMs: 500,
-  })
-
-  assert.equal(result.resilienceScore, null)
-  assert.equal(result.scoreStatus, 'insufficient-metrics')
-})
-
-test('missing timeout durations are unavailable rather than fabricated zero scores', () => {
-  const detectionFailure = calculateResilienceScore({
-    status: 'detection-timeout',
-    recoveryTimeMs: null,
-    detectionTimeMs: null,
-    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
-    podRestartCount: 0,
-  })
-  const recoveryFailure = calculateResilienceScore({
-    status: 'recovery-timeout',
-    recoveryTimeMs: null,
-    detectionTimeMs: 500,
-    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
-    podRestartCount: 0,
-  })
-
-  assert.equal(detectionFailure.scoreBreakdown.detection, null)
-  assert.equal(recoveryFailure.scoreBreakdown.recovery, null)
-})
-
-test('legacy timeout scores timing from recorded readiness transitions', () => {
-  const result = calculateResilienceScore({
+test('detection and recovery timeouts never become fabricated measured scores', () => {
+  const detectionTimeout = calculateResilienceScore(completeExperiment({
     type: 'pod-failure',
     status: 'detection-timeout',
-    startedAt: '2026-10-10T10:29:42.223Z',
-    completedAt: '2026-10-10T10:29:56.079Z',
-    detectionTimeMs: null,
-    recoveryTimeMs: null,
-    readinessSamples: [
-      {
-        readyPods: 1,
-        totalPods: 1,
-        recordedAt: '2026-10-10T10:29:48.488Z',
-      },
-      {
-        readyPods: 0,
-        totalPods: 1,
-        recordedAt: '2026-10-10T10:29:50.207Z',
-      },
-      {
-        readyPods: 1,
-        totalPods: 1,
-        recordedAt: '2026-10-10T10:29:56.079Z',
-      },
-    ],
-  })
+    detectionMeasurement: {
+      status: 'not-detected',
+      detectionTimeMs: null,
+      reason: 'No detection before timeout.',
+    },
+    recoveryMeasurement: {
+      status: 'unavailable',
+      recoveryTimeMs: null,
+      reason: 'Detection timed out.',
+    },
+  }))
+  assert.equal(detectionTimeout.scoreBreakdown.detection, null)
+  assert.equal(detectionTimeout.scoreBreakdown.recovery, null)
+  assert.equal(detectionTimeout.resilienceScore, null)
+  assert.equal(detectionTimeout.scoreStatus, 'incomplete-experiment')
 
-  assert.equal(result.scoreBreakdown.detection, 60)
-  assert.equal(result.scoreBreakdown.recovery, 60)
-  assert.equal(result.scoreMeasurements.detectionTimeMs, 7984)
-  assert.equal(result.scoreMeasurements.recoveryTimeMs, 5872)
+  const recoveryTimeout = calculateResilienceScore(completeExperiment({
+    type: 'pod-failure',
+    status: 'recovery-timeout',
+    detectionMeasurement: { status: 'measured', detectionTimeMs: 500 },
+    recoveryMeasurement: {
+      status: 'recovery-timeout',
+      recoveryTimeMs: null,
+      reason: 'Service recovery timed out.',
+    },
+  }))
+  assert.equal(recoveryTimeout.scoreBreakdown.recovery, null)
+  assert.equal(recoveryTimeout.resilienceScore, null)
 })
 
-test('incomplete experiment statuses do not receive an overall score', () => {
-  const failed = calculateResilienceScore({
-    status: 'failed',
-    detectionTimeMs: 100,
-    recoveryTimeMs: 100,
-    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
-    restartCountBefore: 0,
-    restartCountAfter: 0,
-    errorRateMeasurement: { status: 'measured', errorRatePercent: 0 },
-  })
+test('missing or invalid measurements do not receive substitute scores', () => {
+  const missing = calculateResilienceScore(completeExperiment({
+    responseTimeMeasurement: {
+      status: 'unavailable',
+      baselineResponseTimeMs: null,
+      averageResponseTimeMs: null,
+      reason: 'Probe disabled.',
+    },
+    errorRateMeasurement: { status: 'no-traffic', totalRequests: 0 },
+    detectionMeasurement: {
+      status: 'not-detected',
+      reason: 'No unhealthy condition was observed.',
+    },
+  }))
+  assert.equal(missing.scoreBreakdown.performance, null)
+  assert.equal(missing.scoreBreakdown.errorHandling, null)
+  assert.equal(missing.scoreBreakdown.detection, null)
+  assert.equal(missing.resilienceScore, null)
+  assert.deepEqual(missing.missingMetrics, [
+    'performance',
+    'errorHandling',
+    'detection',
+  ])
+  assert.match(missing.missingMetricReasons.performance, /Probe disabled/)
 
-  assert.deepEqual(Object.values(failed.scoreBreakdown), [100, 100, 100, 100])
-  assert.equal(failed.resilienceScore, null)
-  assert.equal(failed.scoreStatus, 'incomplete-experiment')
-  assert.match(failed.scoreUnavailableReason, /status is "failed"/)
+  const invalidTime = calculateResilienceScore(completeExperiment({
+    detectionMeasurement: { status: 'measured', detectionTimeMs: 0 },
+    recoveryMeasurement: { status: 'measured', recoveryTimeMs: -10 },
+  }))
+  assert.equal(invalidTime.scoreBreakdown.detection, null)
+  assert.equal(invalidTime.scoreBreakdown.recovery, null)
+  assert.equal(invalidTime.resilienceScore, null)
 })
 
-test('CPU and memory samples remain separate from unmeasured timing metrics', () => {
-  const cpuResult = calculateResilienceScore({
-    type: 'cpu-stress',
-    status: 'completed',
-    cpuSamples: [{ cpu: 0.9, recordedAt: '2026-01-01T00:00:00.000Z' }],
-    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
-    restartCountBefore: 0,
-    restartCountAfter: 0,
-  })
-  const memoryResult = calculateResilienceScore({
-    type: 'memory-stress',
-    status: 'completed',
-    memorySamples: [
-      { memoryBytes: 1048576, recordedAt: '2026-01-01T00:00:00.000Z' },
-    ],
-    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
-    restartCountBefore: 0,
-    restartCountAfter: 0,
-  })
-
-  for (const result of [cpuResult, memoryResult]) {
-    assert.equal(result.scoreBreakdown.availability, 100)
-    assert.equal(result.scoreBreakdown.stability, 100)
-    assert.equal(result.scoreMeasurements.detectionTimeMs, null)
-    assert.equal(result.scoreMeasurements.recoveryTimeMs, null)
-    assert.deepEqual(result.scoreBreakdown, {
-      recovery: null,
-      detection: null,
-      availability: 100,
-      stability: 100,
-    })
-  }
-})
-
-test('invalid negative durations are unavailable rather than scored', () => {
-  const result = calculateResilienceScore({
-    status: 'completed',
-    detectionTimeMs: -5,
-    recoveryTimeMs: -10,
-    availabilityMeasurement: { status: 'measured', availabilityPercent: 100 },
-  })
-
-  assert.equal(result.scoreBreakdown.detection, null)
-  assert.equal(result.scoreBreakdown.recovery, null)
-  assert.equal(result.scoreMeasurements.detectionTimeMs, null)
-  assert.equal(result.scoreMeasurements.recoveryTimeMs, null)
+test('incomplete stress experiment retains measured component evidence but has no overall score', () => {
+  const result = calculateResilienceScore(completeExperiment({
+    status: 'measurement-incomplete',
+  }))
+  assert.equal(result.scoreBreakdown.availability, 96)
   assert.equal(result.resilienceScore, null)
+  assert.equal(result.scoreStatus, 'incomplete-experiment')
 })

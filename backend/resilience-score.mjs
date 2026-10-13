@@ -1,65 +1,50 @@
 import { inferReadinessTimings } from './pod-failure-observations.mjs'
 
 export const RESILIENCE_SCORE_WEIGHTS = Object.freeze({
-  recovery: 35,
-  detection: 25,
-  availability: 25,
-  stability: 15,
+  availability: 20,
+  performance: 20,
+  errorHandling: 20,
+  detection: 20,
+  recovery: 20,
 })
 
-const defaultTimeScoreThresholds = Object.freeze([
-  Object.freeze({ maxMs: 1000, score: 100 }),
-  Object.freeze({ maxMs: 3000, score: 90 }),
-  Object.freeze({ maxMs: 5000, score: 80 }),
-  Object.freeze({ maxMs: 10000, score: 60 }),
-  Object.freeze({ maxMs: 20000, score: 40 }),
-  Object.freeze({ maxMs: null, score: 20 }),
-])
+const defaultScoreTargets = Object.freeze({
+  responseTimeDegradationTolerancePercent: 20,
+  detectionTimeMs: 1000,
+  recoveryTimeMs: 5000,
+})
 
-function loadTimeScoreThresholds(environmentName) {
-  const configured = process.env[environmentName]
-  const thresholds = configured === undefined
-    ? defaultTimeScoreThresholds
-    : JSON.parse(configured)
-  const valid =
-    Array.isArray(thresholds) &&
-    thresholds.length > 0 &&
-    thresholds.every((threshold, index) =>
-      threshold &&
-      (threshold.maxMs === null ||
-        (Number.isFinite(threshold.maxMs) && threshold.maxMs >= 0)) &&
-      Number.isFinite(threshold.score) &&
-      threshold.score >= 0 &&
-      threshold.score <= 100 &&
-      (index === 0 ||
-        (
-          thresholds[index - 1].maxMs !== null &&
-          (threshold.maxMs === null ||
-            threshold.maxMs > thresholds[index - 1].maxMs) &&
-          threshold.score <= thresholds[index - 1].score
-        )),
-    ) &&
-    thresholds.at(-1).maxMs === null
-
-  if (!valid) {
-    throw new Error(
-      `${environmentName} must be a JSON array of { "maxMs": number|null, "score": 0..100 } entries, with increasing limits, non-increasing scores, and a final null limit.`,
-    )
+export function getResilienceScoreTargets() {
+  const targets = {
+    responseTimeDegradationTolerancePercent: Number(
+      process.env.CHAOSGUARD_RESPONSE_TIME_DEGRADATION_TOLERANCE_PERCENT ??
+        defaultScoreTargets.responseTimeDegradationTolerancePercent,
+    ),
+    detectionTimeMs: Number(
+      process.env.CHAOSGUARD_DETECTION_TARGET_MS ??
+        defaultScoreTargets.detectionTimeMs,
+    ),
+    recoveryTimeMs: Number(
+      process.env.CHAOSGUARD_RECOVERY_TARGET_MS ??
+        defaultScoreTargets.recoveryTimeMs,
+    ),
   }
-
-  return Object.freeze(
-    thresholds.map((threshold) => Object.freeze({ ...threshold })),
-  )
+  for (const [name, value] of Object.entries(targets)) {
+    const invalidValue =
+      !Number.isFinite(value) ||
+      (name === 'responseTimeDegradationTolerancePercent'
+        ? value < 0
+        : value <= 0)
+    if (invalidValue) {
+      throw new Error(
+        name === 'responseTimeDegradationTolerancePercent'
+          ? `${name} must be configured as a non-negative percentage`
+          : `${name} must be configured as a positive number of milliseconds`,
+      )
+    }
+  }
+  return targets
 }
-
-export const RESILIENCE_TIME_SCORE_THRESHOLDS = Object.freeze({
-  recovery: loadTimeScoreThresholds(
-    'CHAOSGUARD_RECOVERY_SCORE_THRESHOLDS',
-  ),
-  detection: loadTimeScoreThresholds(
-    'CHAOSGUARD_DETECTION_SCORE_THRESHOLDS',
-  ),
-})
 
 export function measureAvailability({
   readinessSamples,
@@ -201,22 +186,231 @@ export function measureAvailability({
     ...coverage,
     status: 'measured',
     availabilityPercent:
-      Math.round((healthyDurationMs / validObservedDurationMs) * 10000) / 100,
+      Math.round(
+        (base.healthySampleCount / base.validSampleCount) * 10000,
+      ) / 100,
     reason: null,
   }
 }
 
-function scoreDuration(durationMs, thresholds) {
-  if (!Number.isFinite(durationMs) || durationMs < 0) return null
-  return thresholds.find(
-    ({ maxMs }) => maxMs === null || durationMs <= maxMs,
-  )?.score ?? null
+function scoreRatio(target, actual) {
+  if (
+    !Number.isFinite(target) ||
+    target <= 0 ||
+    !Number.isFinite(actual) ||
+    actual <= 0
+  ) {
+    return null
+  }
+  return Math.round(Math.min(100, (target / actual) * 100) * 100) / 100
 }
 
-export function scoreRecovery(
-  experiment,
-  thresholds = RESILIENCE_TIME_SCORE_THRESHOLDS.recovery,
-) {
+function validPercent(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 100
+    ? Math.round(value * 100) / 100
+    : null
+}
+
+function measureErrorHandling(measurement) {
+  if (measurement?.status !== 'measured') return null
+  const totalRequests = measurement.totalRequests
+  const successfulRequests = measurement.successfulRequests ??
+    (Number.isFinite(totalRequests) &&
+      Number.isFinite(measurement.failedRequests) &&
+      Number.isFinite(measurement.clientErrorRequests)
+      ? totalRequests - measurement.failedRequests - measurement.clientErrorRequests
+      : null)
+  if (
+    !Number.isFinite(totalRequests) ||
+    totalRequests <= 0 ||
+    !Number.isFinite(successfulRequests) ||
+    successfulRequests < 0 ||
+    successfulRequests > totalRequests
+  ) {
+    return null
+  }
+  return Math.round((successfulRequests / totalRequests) * 10000) / 100
+}
+
+function calculateStressResilienceScore(experiment) {
+  return calculateCommonResilienceScore(experiment)
+}
+
+function calculateCommonResilienceScore(experiment) {
+  const targets = getResilienceScoreTargets()
+  const availabilityMeasurement = experiment.availabilityMeasurement
+  const responseTimeMeasurement = experiment.responseTimeMeasurement ||
+    experiment.httpTrafficProbeMeasurement
+  const baselineResponseMeasurement =
+    experiment.baselineResponseTimeMeasurement || null
+  const baselineResponseTimeMs = responseTimeMeasurement?.baselineResponseTimeMs ??
+    experiment.baselineResponseTimeMs
+  const averageResponseTimeMs = responseTimeMeasurement?.averageResponseTimeMs ??
+    experiment.averageResponseTimeMs
+  const detectionMeasurement = experiment.detectionMeasurement
+  const recoveryMeasurement = experiment.recoveryMeasurement
+  const inferredTimings = inferReadinessTimings(experiment)
+  const detectionTimeMs = detectionMeasurement
+    ? detectionMeasurement.status === 'measured'
+      ? detectionMeasurement.detectionTimeMs
+      : null
+    : experiment.status === 'detection-timeout'
+      ? null
+      : experiment.detectionTimeMs ?? inferredTimings.detectionTimeMs
+  const recoveryTimeMs = recoveryMeasurement
+    ? recoveryMeasurement.status === 'measured'
+      ? recoveryMeasurement.recoveryTimeMs
+      : null
+    : experiment.status === 'recovery-timeout'
+      ? null
+      : experiment.recoveryTimeMs ?? inferredTimings.recoveryTimeMs
+  const errorHandlingScore = measureErrorHandling(experiment.errorRateMeasurement)
+  const performanceThresholdMs =
+    Number.isFinite(baselineResponseTimeMs) && baselineResponseTimeMs > 0
+      ? baselineResponseTimeMs *
+        (1 + targets.responseTimeDegradationTolerancePercent / 100)
+      : null
+  const scoreBreakdown = {
+    availability: availabilityMeasurement?.status === 'measured'
+      ? validPercent(availabilityMeasurement.availabilityPercent)
+      : null,
+    performance: responseTimeMeasurement?.status === 'measured'
+      ? scorePerformance({
+          baselineResponseTimeMs,
+          averageResponseTimeMs,
+        })
+      : null,
+    errorHandling: errorHandlingScore,
+    detection: scoreRatio(targets.detectionTimeMs, detectionTimeMs),
+    recovery: scoreRatio(targets.recoveryTimeMs, recoveryTimeMs),
+  }
+  const missingMetricReasons = {}
+  const reasons = {
+    availability: availabilityMeasurement?.reason ||
+      'No sufficiently covered Kubernetes readiness measurement was recorded.',
+    performance: responseTimeMeasurement?.reason ||
+      'Actual response-time samples were not recorded during the experiment.',
+    errorHandling: experiment.errorRateMeasurement?.reason ||
+      'Prometheus did not provide valid request and error counts for the experiment.',
+    detection: detectionMeasurement?.reason ||
+      'No valid monitoring detection time was recorded.',
+    recovery: recoveryMeasurement?.reason ||
+      'No valid post-injection service recovery time was recorded.',
+  }
+  for (const [metric, score] of Object.entries(scoreBreakdown)) {
+    if (score === null) missingMetricReasons[metric] = reasons[metric]
+  }
+
+  const complete =
+    Object.values(scoreBreakdown).every(Number.isFinite) &&
+    experiment.status === 'completed'
+  const averageScore = complete
+    ? Object.values(scoreBreakdown).reduce((total, score) => total + score, 0) / 5
+    : null
+  const resilienceScore = averageScore === null
+    ? null
+    : Math.round(averageScore * 100) / 100
+
+  return {
+    resilienceScore,
+    scoreBreakdown,
+    scoreWeights: RESILIENCE_SCORE_WEIGHTS,
+    scoreTargets: targets,
+    effectiveScoreWeights: complete ? RESILIENCE_SCORE_WEIGHTS : {},
+    scoreStatus: complete
+      ? 'complete-real-metrics'
+      : experiment.status !== 'completed'
+        ? 'incomplete-experiment'
+        : 'insufficient-metrics',
+    scoreUnavailableReason: complete
+      ? null
+      : experiment.status !== 'completed'
+        ? `A final score requires a completed experiment; current status is "${experiment.status || 'unknown'}".`
+        : 'A final score requires valid measurements for all five components.',
+    missingMetrics: Object.keys(missingMetricReasons),
+    missingMetricReasons,
+    scoreMeasurements: {
+      availabilityPercent: validPercent(availabilityMeasurement?.availabilityPercent),
+      availabilityMeasurement: availabilityMeasurement || null,
+      readinessObservationCount:
+        availabilityMeasurement?.validSampleCount ?? 0,
+      baselineResponseTimeMs:
+        Number.isFinite(baselineResponseTimeMs) && baselineResponseTimeMs > 0
+          ? baselineResponseTimeMs
+          : null,
+      averageResponseTimeMs:
+        Number.isFinite(averageResponseTimeMs) && averageResponseTimeMs > 0
+          ? averageResponseTimeMs
+          : null,
+      acceptableResponseTimeMs: performanceThresholdMs,
+      responseTimeDegradationPercent:
+        Number.isFinite(baselineResponseTimeMs) &&
+        baselineResponseTimeMs > 0 &&
+        Number.isFinite(averageResponseTimeMs) &&
+        averageResponseTimeMs > 0
+          ? Math.round(
+              ((averageResponseTimeMs - baselineResponseTimeMs) /
+                baselineResponseTimeMs) *
+                10000,
+            ) / 100
+          : null,
+      errorHandlingMeasurement: experiment.errorRateMeasurement || null,
+      baselineErrorHandlingMeasurement:
+        baselineResponseMeasurement || null,
+      successfulRequests:
+        experiment.errorRateMeasurement?.successfulRequests ?? null,
+      totalRequests:
+        experiment.errorRateMeasurement?.totalRequests ?? null,
+      baselineSuccessfulRequests:
+        baselineResponseMeasurement?.successfulRequests ?? null,
+      baselineTotalRequests:
+        baselineResponseMeasurement?.totalRequests ?? null,
+      baselineErrorRatePercent:
+        Number.isFinite(baselineResponseMeasurement?.errorRatePercent)
+          ? baselineResponseMeasurement.errorRatePercent
+          : null,
+      detectionTimeMs:
+        Number.isFinite(detectionTimeMs) && detectionTimeMs > 0
+          ? detectionTimeMs
+          : null,
+      detectionMeasurement: detectionMeasurement || null,
+      recoveryTimeMs:
+        Number.isFinite(recoveryTimeMs) && recoveryTimeMs > 0
+          ? recoveryTimeMs
+          : null,
+      recoveryMeasurement: recoveryMeasurement || null,
+      cpuUtilizationPercent:
+        Number.isFinite(experiment.cpuUtilizationPercent) &&
+        experiment.cpuUtilizationPercent >= 0
+          ? experiment.cpuUtilizationPercent
+          : null,
+      memoryUtilizationPercent:
+        Number.isFinite(experiment.memoryUtilizationPercent) &&
+        experiment.memoryUtilizationPercent >= 0
+          ? experiment.memoryUtilizationPercent
+          : null,
+      restartCountDelta: getRestartCountDelta(experiment),
+      podRestartCount:
+        Number.isSafeInteger(experiment.podRestartCount) &&
+        experiment.podRestartCount >= 0
+          ? experiment.podRestartCount
+          : null,
+      oomKilledObservations:
+        Array.isArray(experiment.oomKilledObservations)
+          ? experiment.oomKilledObservations
+          : [],
+      metricMeasurementStatus: Object.fromEntries(
+        Object.entries(scoreBreakdown).map(([metric, score]) => [
+          metric,
+          score === null ? 'unavailable' : 'measured',
+        ]),
+      ),
+    },
+  }
+}
+
+export function scoreRecovery(experiment) {
+  if (experiment.status === 'recovery-timeout') return null
   const inferredTimings =
     inferReadinessTimings(experiment)
   const inferredRecovery =
@@ -225,16 +419,14 @@ export function scoreRecovery(
       ? inferredTimings.recoveryTimeMs
       : null
 
-  return scoreDuration(
+  return scoreRatio(
+    getResilienceScoreTargets().recoveryTimeMs,
     experiment.recoveryTimeMs ?? inferredRecovery,
-    thresholds,
   )
 }
 
-export function scoreDetection(
-  experiment,
-  thresholds = RESILIENCE_TIME_SCORE_THRESHOLDS.detection,
-) {
+export function scoreDetection(experiment) {
+  if (experiment.status === 'detection-timeout') return null
   const inferredTimings =
     inferReadinessTimings(experiment)
   const inferredDetection =
@@ -243,10 +435,20 @@ export function scoreDetection(
       ? inferredTimings.detectionTimeMs
       : null
 
-  return scoreDuration(
+  return scoreRatio(
+    getResilienceScoreTargets().detectionTimeMs,
     experiment.detectionTimeMs ?? inferredDetection,
-    thresholds,
   )
+}
+
+export function scorePerformance({ baselineResponseTimeMs, averageResponseTimeMs }) {
+  const targets = getResilienceScoreTargets()
+  const acceptableResponseTimeMs =
+    Number.isFinite(baselineResponseTimeMs) && baselineResponseTimeMs > 0
+      ? baselineResponseTimeMs *
+        (1 + targets.responseTimeDegradationTolerancePercent / 100)
+      : null
+  return scoreRatio(acceptableResponseTimeMs, averageResponseTimeMs)
 }
 
 export function scoreAvailability(availabilityPercent) {
@@ -382,191 +584,11 @@ export function scoreErrorRate(errorRatePercent) {
     return null
   }
 
-  if (errorRatePercent <= 0.1) return 100
-  if (errorRatePercent <= 1) return 80
-  if (errorRatePercent <= 5) return 60
-  if (errorRatePercent <= 10) return 30
-  return 0
-}
-
-function getMissingMetricReasons(experiment, scoreBreakdown) {
-  const reasons = {}
-  const status = experiment.status
-
-  if (scoreBreakdown.recovery === null) {
-    reasons.recovery =
-      status === 'detection-timeout'
-        ? 'Recovery was not observed because failure detection timed out.'
-        : 'No valid recovery duration was recorded for this experiment.'
-  }
-
-  if (scoreBreakdown.detection === null) {
-    reasons.detection =
-      'No valid detection duration was recorded for this experiment.'
-  }
-
-  if (scoreBreakdown.availability === null) {
-    reasons.availability =
-      experiment.availabilityMeasurement?.reason ||
-      'No trustworthy timestamped Kubernetes readiness measurement was recorded for this experiment.'
-  }
-
-  if (scoreBreakdown.stability === null) {
-    reasons.stability =
-      experiment.type === 'pod-failure'
-        ? measurePodStability(experiment).reason
-        : 'Pod restart counts were not available before and after the experiment.'
-  }
-
-  return reasons
+  return Math.round((100 - errorRatePercent) * 100) / 100
 }
 
 export function calculateResilienceScore(experiment) {
-  const scoreBreakdown = {
-    recovery: scoreRecovery(experiment),
-    detection: scoreDetection(experiment),
-    availability:
-      experiment.availabilityMeasurement?.status === 'measured'
-        ? experiment.type === 'pod-failure'
-          ? scorePodFailureAvailability(experiment.availabilityMeasurement)
-          : scoreAvailability(
-              experiment.availabilityMeasurement.availabilityPercent,
-            )
-        : null,
-    stability: scoreStability(experiment),
-  }
-
-  const availableMetrics = Object.entries(scoreBreakdown)
-    .filter(([, score]) => score !== null)
-
-  const availableWeight = availableMetrics.reduce(
-    (total, [metric]) => total + RESILIENCE_SCORE_WEIGHTS[metric],
-    0,
-  )
-  const weightedTotal = availableMetrics.reduce(
-    (total, [metric, score]) =>
-      total + score * RESILIENCE_SCORE_WEIGHTS[metric],
-    0,
-  )
-  const effectiveScoreWeights = Object.fromEntries(
-    availableMetrics.map(([metric]) => [
-      metric,
-      Math.round((RESILIENCE_SCORE_WEIGHTS[metric] / availableWeight) * 10000) /
-        100,
-    ]),
-  )
-  const statusAllowsScore =
-    experiment.status === 'completed' ||
-    experiment.status === 'detection-timeout' ||
-    experiment.status === 'recovery-timeout'
-  const resilienceScore =
-    statusAllowsScore &&
-    availableMetrics.length >= 2
-      ? Math.round((weightedTotal / availableWeight) * 10) / 10
-      : null
-
-  const missingMetricReasons =
-    getMissingMetricReasons(experiment, scoreBreakdown)
-  const insufficientStatus =
-    !statusAllowsScore
-  let scoreStatus
-
-  if (insufficientStatus) {
-    scoreStatus = 'incomplete-experiment'
-  } else if (availableMetrics.length < 2) {
-    scoreStatus = 'insufficient-metrics'
-  } else if (availableMetrics.length < Object.keys(scoreBreakdown).length) {
-    scoreStatus = 'partial-real-metrics'
-  } else {
-    scoreStatus = 'complete-real-metrics'
-  }
-
-  return {
-    resilienceScore,
-    scoreBreakdown,
-    scoreWeights: RESILIENCE_SCORE_WEIGHTS,
-    scoreThresholdsMs: {
-      recovery: RESILIENCE_TIME_SCORE_THRESHOLDS.recovery,
-      detection: RESILIENCE_TIME_SCORE_THRESHOLDS.detection,
-    },
-    availableWeightPercent: availableWeight,
-    effectiveScoreWeights,
-    scoreStatus,
-    scoreUnavailableReason: insufficientStatus
-      ? `An overall score is not reported while experiment status is "${experiment.status || 'unknown'}".`
-      : availableMetrics.length < 2
-        ? 'At least two valid measured metrics are required.'
-        : null,
-    missingMetrics: Object.keys(missingMetricReasons),
-    missingMetricReasons,
-    scoreMeasurements: {
-      recoveryTimeMs:
-        getScoreMeasurementDuration(
-          experiment.recoveryTimeMs,
-          inferReadinessTimings(experiment).recoveryTimeMs,
-        ),
-      detectionTimeMs:
-        getScoreMeasurementDuration(
-          experiment.detectionTimeMs,
-          inferReadinessTimings(experiment).detectionTimeMs,
-        ),
-      availabilityPercent: meanAvailabilityPercent(
-        experiment.availabilityMeasurement,
-      ),
-      availabilityMeasurement:
-        experiment.availabilityMeasurement || null,
-      readinessObservationCount:
-        experiment.availabilityMeasurement?.validSampleCount ?? 0,
-      restartCountDelta:
-        experiment.type === 'pod-failure'
-          ? measurePodStability(experiment).restartCountDelta
-          : getRestartCountDelta(experiment),
-      podStabilityMeasurement:
-        experiment.type === 'pod-failure'
-          ? measurePodStability(experiment)
-          : null,
-      metricMeasurementStatus: {
-        recovery:
-          getScoreMeasurementDuration(
-            experiment.recoveryTimeMs,
-            inferReadinessTimings(experiment).recoveryTimeMs,
-          ) === null
-            ? 'unavailable'
-            : 'measured',
-        detection:
-          getScoreMeasurementDuration(
-            experiment.detectionTimeMs,
-            inferReadinessTimings(experiment).detectionTimeMs,
-          ) === null
-            ? 'unavailable'
-            : 'measured',
-        availability:
-          experiment.availabilityMeasurement?.status || 'unavailable',
-        stability:
-          experiment.type === 'pod-failure'
-            ? measurePodStability(experiment).status
-            : Number.isSafeInteger(getRestartCountDelta(experiment))
-              ? 'measured'
-              : 'unavailable',
-      },
-      podRestartCount:
-        Number.isSafeInteger(experiment.podRestartCount) &&
-        experiment.podRestartCount >= 0
-          ? experiment.podRestartCount
-          : null,
-      errorRatePercent:
-        experiment.errorRateMeasurement?.status === 'measured' &&
-        Number.isFinite(
-          experiment.errorRateMeasurement.errorRatePercent,
-        ) &&
-        experiment.errorRateMeasurement.errorRatePercent >= 0 &&
-        experiment.errorRateMeasurement.errorRatePercent <= 100
-          ? experiment.errorRateMeasurement.errorRatePercent
-          : null,
-      errorRateMeasurement:
-        experiment.errorRateMeasurement || null,
-    },
-  }
+  return calculateCommonResilienceScore(experiment)
 }
 
 function getScoreMeasurementDuration(measured, inferred) {

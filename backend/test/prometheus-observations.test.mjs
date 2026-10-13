@@ -33,6 +33,7 @@ test('error rate uses actual request counts, reports 4xx separately, and exclude
   assert.equal(measured.totalRequests, 20)
   assert.equal(measured.failedRequests, 2)
   assert.equal(measured.clientErrorRequests, 4)
+  assert.equal(measured.successfulRequests, 14)
 
   const noTraffic = createErrorRateMeasurement({
     target: 'user-service',
@@ -46,6 +47,7 @@ test('error rate uses actual request counts, reports 4xx separately, and exclude
   })
   assert.equal(noTraffic.status, 'no-traffic')
   assert.equal(noTraffic.errorRatePercent, null)
+  assert.equal(noTraffic.successfulRequests, null)
   assert.match(noTraffic.reason, /No HTTP requests/)
 })
 

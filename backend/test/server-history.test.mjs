@@ -156,33 +156,30 @@ test('GET /api/experiments returns and persists scores for completed history', a
   const experiment = history.experiments.find(
     (item) => item.id === 'persisted-score-test',
   )
-  assert.equal(experiment.resilienceScore, 81.2)
-  assert.equal(experiment.scoreBreakdown.recovery, 90)
+  assert.equal(experiment.resilienceScore, null)
+  assert.equal(experiment.scoreBreakdown.recovery, 100)
   assert.equal(experiment.scoreBreakdown.detection, 100)
-  assert.equal(experiment.scoreBreakdown.availability, 50)
-  assert.equal(experiment.scoreBreakdown.stability, null)
-  assert.equal(Object.hasOwn(experiment.scoreBreakdown, 'errorRate'), false)
-  assert.equal(experiment.availableWeightPercent, 85)
+  assert.equal(experiment.scoreBreakdown.availability, 66.67)
+  assert.equal(experiment.scoreBreakdown.performance, null)
+  assert.equal(experiment.scoreBreakdown.errorHandling, null)
   assert.deepEqual(experiment.scoreWeights, {
-    recovery: 35,
-    detection: 25,
-    availability: 25,
-    stability: 15,
+    availability: 20,
+    performance: 20,
+    errorHandling: 20,
+    detection: 20,
+    recovery: 20,
   })
-  assert.deepEqual(experiment.effectiveScoreWeights, {
-    recovery: 41.18,
-    detection: 29.41,
-    availability: 29.41,
-  })
+  assert.deepEqual(experiment.effectiveScoreWeights, {})
+  assert.deepEqual(experiment.missingMetrics, ['performance', 'errorHandling'])
   assert.equal(experiment.availabilityMeasurement.status, 'measured')
-  assert.equal(experiment.availabilityMeasurement.availabilityPercent, 50)
+  assert.equal(experiment.availabilityMeasurement.availabilityPercent, 66.67)
   assert.equal(experiment.errorRateMeasurement.status, 'no-traffic')
 
   const persisted = JSON.parse(
     await readFile(join(dataDirectory, 'experiments.json'), 'utf8'),
   )
-  assert.equal(persisted[0].resilienceScore, 81.2)
-  assert.equal(persisted[0].scoreBreakdown.availability, 50)
+  assert.equal(persisted[0].resilienceScore, null)
+  assert.equal(persisted[0].scoreBreakdown.availability, 66.67)
 
   const unauthenticatedDelete = await fetch(
     `${baseUrl}/api/experiments/persisted-score-test`,
